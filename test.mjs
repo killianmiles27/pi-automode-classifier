@@ -1155,6 +1155,11 @@ bash("allow", "/usr/bin/git status");
 // Variables that load other code into an allowed program.
 bash("classify", "LD_PRELOAD=/tmp/x.so ls");
 bash("classify", "env LD_PRELOAD=/tmp/x.so ls");
+bash("classify", "env");
+bash("classify", "env | grep -i token");
+bash("classify", "printenv");
+bash("allow", "printenv HOME");
+bash("allow", "env FOO=1 ls");
 bash("classify", "export LD_PRELOAD=/tmp/x.so");
 bash("classify", "BASH_ENV=/tmp/x bash -n script.sh");
 bash("classify", 'NODE_OPTIONS="--require ./x.js" tsc');

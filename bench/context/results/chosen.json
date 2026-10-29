@@ -1,0 +1,57 @@
+{
+  "Rules alone": {},
+  "Rules + LANCET": {
+    "t": 0.05
+  },
+  "Rules + Jev (command only)": {
+    "t": 0.1
+  },
+  "Rules + LANCET, Jev on the unsure band": {
+    "lo": 0.05,
+    "hi": 0.6,
+    "t": 0.3
+  },
+  "Rules + Jev with your request": {
+    "H": 0.2,
+    "A": 0.7,
+    "AH": 0.95
+  },
+  "Rules + LANCET, then Jev with your request": {
+    "lo": 0.05,
+    "H": 0.2,
+    "A": 0.7,
+    "AH": 0.95
+  },
+  "Rules + LANCET gate, Jev with your request in the middle": {
+    "lo": 0.05,
+    "hi": 0.3,
+    "H": 0.2,
+    "A": 0.5,
+    "AH": 0.9
+  },
+  "Rules + LANCET, then Jev: runs only if you asked": {
+    "lo": 0.05,
+    "A": 0.65,
+    "AH": 0.95
+  },
+  "Rules + LANCET and Jev agree, or you asked": {
+    "lo": 0.05,
+    "hi": 0.1,
+    "H": 0.1,
+    "A": 0.7,
+    "AH": 1.01
+  },
+  "DEPLOYED: rules + LANCET + Jev with your request": {
+    "lo": 0.05,
+    "hi": 0.1,
+    "H": 0.1,
+    "A": 0.6,
+    "low": 0.1
+  },
+  "Rules + LANCET, Jev with your request on rule asks only": {
+    "t": 0.05,
+    "H": 0.2,
+    "A": 0.5,
+    "AH": 0.8
+  }
+}

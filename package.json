@@ -1,7 +1,7 @@
 {
   "name": "pi-automode-classifier",
-  "version": "0.3.0",
-  "description": "Auto mode for Pi: deterministic rules first, then a local decision model, then a confirm prompt",
+  "version": "0.4.0",
+  "description": "Auto mode for Pi: rules, a local classifier, then a decider that checks whether you asked for the call",
   "keywords": [
     "pi-package",
     "pi-extension",
@@ -15,15 +15,16 @@
   "author": "Deepu K Sasidharan",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/deepu105/pi-automode-classifier.git"
+    "url": "git+https://github.com/killianmiles27/pi-automode-classifier.git"
   },
-  "homepage": "https://github.com/deepu105/pi-automode-classifier#readme",
+  "homepage": "https://github.com/killianmiles27/pi-automode-classifier#readme",
   "bugs": {
-    "url": "https://github.com/deepu105/pi-automode-classifier/issues"
+    "url": "https://github.com/killianmiles27/pi-automode-classifier/issues"
   },
   "type": "module",
   "files": [
     "index.ts",
+    "context.ts",
     "rules.ts",
     "automode.ts",
     "automode-rules.json",
@@ -34,10 +35,11 @@
     "LICENSE"
   ],
   "scripts": {
-    "test": "node test.mjs",
+    "test": "node test.mjs && node test-context.mjs",
     "bench": "node bench/run.mjs --stages classifier",
     "bench:llm": "node bench/run.mjs --stages llm --suites user-requests,bench-llm-cases",
-    "bench:flow": "node bench/run.mjs --stages flow"
+    "bench:flow": "node bench/run.mjs --stages flow",
+    "bench:context": "node bench/context/collect.ts && node bench/context/analyze.ts"
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*"
@@ -46,5 +48,8 @@
     "extensions": [
       "./index.ts"
     ]
-  }
+  },
+  "contributors": [
+    "Killian Miles (context decider)"
+  ]
 }

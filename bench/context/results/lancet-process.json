@@ -1,0 +1,6 @@
+{
+  "coldStartMs": 264,
+  "peakRssMb": 316.15234375,
+  "model": "LANCET Nano v0.4.3 CPU INT8",
+  "jev": "typesafe/jev-1.14"
+}

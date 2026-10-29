@@ -137,5 +137,49 @@
     // Only used when another decider comes after this one: a score below this runs, and a score
     // from this up to askAbove goes to the next decider.
     "allowBelow": 0.1
-  }
+  },
+
+  // Jev reads your own requests (never tool output) and answers whether you asked for the call and
+  // whether it can do lasting harm. Pick it with "decider": ["command", "context"]. It goes through
+  // Pi's model registry, so log in to the provider with /login. A call runs when LANCET is under
+  // command.askAbove and harm is under allowHarmBelow, or when you asked for it (authorizedAbove)
+  // and harm is under authorizedHarmBelow; the bands below cover the rest.
+  "context": {
+    "provider": "openrouter",
+    "model": "typesafe/jev-1.14",
+    "timeoutMs": 4000,
+    "allowHarmBelow": 0.1,
+    "authorizedAbove": 0.6,
+    "authorizedHarmBelow": 1,
+    // After "Allow <kind> for this session", a call of that kind runs while harm is under this.
+    "sessionHarmBelow": 0.5,
+    // Harm under this runs whatever LANCET says.
+    "lowHarmBelow": 0.1,
+    // Partly asked for (this or more) and fairly harmless (under this): a natural step of your task.
+    "partialAuthorizedAbove": 0.25,
+    "partialHarmBelow": 0.4,
+    // Not asked for (under blockAuthorizedBelow) and harmful (blockHarmAbove or more): blocked
+    // without a prompt, and the agent is told to ask you in chat. After maxAutoBlocks in a row
+    // the next one asks you instead.
+    "blockAuthorizedBelow": 0.1,
+    "blockHarmAbove": 0.9,
+    "maxAutoBlocks": 3,
+    // Prompts for calls at least this harmful get a two-sentence explanation from this model.
+    "explainHarmAbove": 0.25,
+    // Empty provider and model: the session's own model. A small fast model is enough.
+    "explainer": { "provider": "", "model": "", "timeoutMs": 6000 }
+  },
+
+  // Seconds a prompt waits before it blocks the call (0 waits forever). envAskTimeouts overrides it
+  // while a variable is set, for example {"HERDR_PANE_ID": 120} or {"TMUX": 300}, so an agent in
+  // a pane you left carries on with what it can.
+  "askTimeoutSeconds": 0,
+  "envAskTimeouts": {},
+
+  // With the context decider, plain sudo you asked for skips the prompt and sudo's own password
+  // prompt approves it. Only when sudo always asks for a password (no NOPASSWD, timestamp_timeout=0).
+  "sudoPasswordIsApproval": false,
+
+  // More files or folders whose reads always ask, like a tool's API key file. `~` is expanded.
+  "secretPaths": []
 }

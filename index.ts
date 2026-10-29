@@ -37,7 +37,8 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { bashVerdict, commitWrites, compileRules, fileVerdict, isRootLike, makeScope, readVerdict, within, type Action, type SessionFiles, type Verdict } from "./rules.ts";
+import { bashVerdict, commitWrites, compileRules, setSecretPaths, fileVerdict, isRootLike, makeScope, readVerdict, within, type Action, type SessionFiles, type Verdict } from "./rules.ts";
+import { contextState, CTX_QUESTIONS, redact, SHORT_REPLY } from "./context.ts";
 import { buildSystemPrompt, buildTranscript, denyMessage, mergeRules, parseVerdict, STAGE1_INSTRUCTION, stage2Instruction, DEFAULT_RULES, DEFAULT_LLM, type LlmConfig, type Outcome, type TranscriptItem } from "./automode.ts";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -57,8 +58,11 @@ export interface Question {
   askAbove?: number;
 }
 
-export type Decider = "llm" | "classifier" | "command";
-type Scorer = Exclude<Decider, "llm">;
+// "llm" and "context" are terminal: they read the user's requests, so they come last and also
+// judge the asks the rules send on.
+export type Decider = "llm" | "context" | "classifier" | "command";
+type Scorer = Exclude<Decider, "llm" | "context">;
+const TERMINAL: Decider[] = ["llm", "context"];
 
 export interface ClassifierConfig {
   // Local decision model server, used when `provider` is empty.
@@ -122,6 +126,51 @@ export interface Config {
   // goes to its stdin as a JSON line {"command", "shell", "cwd"} and it answers with a JSON line
   // that has a `score` from 0 to 1. A leading `~/` in argv is expanded.
   command: { argv: string[]; timeoutMs: number; askAbove: number; allowBelow: number };
+  // a decision model that reads the user's requests (Jev). Instead of one risk
+  // score it answers two questions, whether the user asked for this action and whether it can
+  // do lasting harm, in one call of about a quarter second. The call runs when harm is below
+  // allowHarmBelow, or when the user asked for it and harm is below authorizedHarmBelow;
+  // otherwise you are asked.
+  context: {
+    provider: string;
+    model: string;
+    timeoutMs: number;
+    allowHarmBelow: number;
+    authorizedAbove: number;
+    authorizedHarmBelow: number;
+    // A call of a kind you allowed for the session runs while Jev's harm is under this.
+    sessionHarmBelow: number;
+    // Harm under this runs whatever LANCET says: LANCET flags network calls and unknown tools
+    // that Jev, which sees the request, can tell are harmless.
+    lowHarmBelow: number;
+    // A natural step of a task you asked for: partly covered by your requests and fairly
+    // harmless. In a real session these were rsync pulls, API lookups and local test runs.
+    partialAuthorizedAbove: number;
+    partialHarmBelow: number;
+    // Clearly unwanted calls are blocked instead of asking you: you did not ask for it
+    // (authorized under blockAuthorizedBelow) and it can do lasting harm (harmful at or above
+    // blockHarmAbove). The agent is told to explain and ask you in chat. After maxAutoBlocks
+    // such blocks in a row, the next one asks you instead, so the agent cannot get stuck.
+    blockAuthorizedBelow: number;
+    blockHarmAbove: number;
+    maxAutoBlocks: number;
+    // A prompt for a call Jev rates at least this harmful gets a short plain-English
+    // explanation of what the command does, written by explainer: a chat model in Pi, or the
+    // session's own model when provider and model are empty. A small fast model is enough.
+    explainHarmAbove: number;
+    explainer: { provider: string; model: string; timeoutMs: number };
+  };
+  // Seconds a confirm prompt waits before it blocks the call. 0 waits forever. envAskTimeouts
+  // overrides it while an environment variable is set, for example {"HERDR_PANE_ID": 120} so an
+  // agent in a multiplexer pane the user left moves on instead of waiting.
+  askTimeoutSeconds: number;
+  envAskTimeouts: Record<string, number>;
+  // Plain sudo goes to the context decider instead of always asking, because sudo's own password
+  // prompt is the approval. Only turn this on when sudo always asks for a password: not with
+  // NOPASSWD, a cached timestamp, or a fingerprint reader that approves silently.
+  sudoPasswordIsApproval: boolean;
+  // More files or directories whose reads count as credential reads (always a critical ask).
+  secretPaths: string[];
 }
 
 export const DEFAULTS: Config = {
@@ -151,10 +200,19 @@ export const DEFAULTS: Config = {
   llm: DEFAULT_LLM,
   // Picked with LANCET Nano 0.4.3; the README has the numbers.
   command: { argv: [], timeoutMs: 5000, askAbove: 0.2, allowBelow: 0.1 },
+  // Tuned on the benchmark's tune split; bench/RESULTS.md has the held-out numbers.
+  context: { provider: "openrouter", model: "typesafe/jev-1.14", timeoutMs: 4000, allowHarmBelow: 0.1, authorizedAbove: 0.6, authorizedHarmBelow: 1, sessionHarmBelow: 0.5,
+    lowHarmBelow: 0.1, partialAuthorizedAbove: 0.25, partialHarmBelow: 0.4, blockAuthorizedBelow: 0.1, blockHarmAbove: 0.9, maxAutoBlocks: 3,
+    explainHarmAbove: 0.25, explainer: { provider: "", model: "", timeoutMs: 6000 } },
+  askTimeoutSeconds: 0,
+  envAskTimeouts: {},
+  sudoPasswordIsApproval: false,
+  secretPaths: [],
 };
 
 // The guard's own files and Pi's settings: changes to them always ask.
-const GUARDED = [HERE, path.dirname(CONFIG_FILE), path.join(AGENT_DIR, "settings.json")];
+// The guard's own files and Pi's settings: changes to them always ask. `guardedPaths` adds more.
+const GUARDED = [HERE, path.dirname(CONFIG_FILE), path.join(AGENT_DIR, "settings.json"), path.join(AGENT_DIR, "sandbox.json"), path.join(AGENT_DIR, "keybindings.json")];
 
 const isObject = (v: unknown): v is Record<string, unknown> => typeof v === "object" && v !== null && !Array.isArray(v);
 const isStrings = (v: unknown) => Array.isArray(v) && v.every((x) => typeof x === "string");
@@ -187,7 +245,7 @@ const SCHEMA: Schema = {
   allowedPaths: isStrings,
   guardedPaths: isStrings,
   withoutUi: { onAsk: oneOf("block", "allow"), rules: { allow: isStrings, deny: isStrings } },
-  decider: (v) => isStrings(v) && (v as string[]).every((d) => ["llm", "classifier", "command"].includes(d)) && new Set(v as string[]).size === (v as string[]).length,
+  decider: (v) => isStrings(v) && (v as string[]).every((d) => ["llm", "context", "classifier", "command"].includes(d)) && new Set(v as string[]).size === (v as string[]).length,
   classifier: {
     endpoint: (v) => typeof v === "string" && URL.canParse(v),
     startCommand: isStrings,
@@ -228,6 +286,13 @@ const SCHEMA: Schema = {
     prompt: { environment: isStrings, hardDeny: isStrings, softDeny: isStrings, allow: isStrings },
   },
   command: { argv: isStrings, timeoutMs: isTimeout, askAbove: isThreshold, allowBelow: isThreshold },
+  context: { provider: isString, model: isString, timeoutMs: isTimeout, allowHarmBelow: isThreshold, authorizedAbove: isThreshold, authorizedHarmBelow: isThreshold, sessionHarmBelow: isThreshold,
+    lowHarmBelow: isThreshold, partialAuthorizedAbove: isThreshold, partialHarmBelow: isThreshold, blockAuthorizedBelow: isThreshold, blockHarmAbove: isThreshold, maxAutoBlocks: atLeast(1),
+    explainHarmAbove: isThreshold, explainer: { provider: isString, model: isString, timeoutMs: isTimeout } },
+  askTimeoutSeconds: atLeast(0),
+  sudoPasswordIsApproval: isBool,
+  envAskTimeouts: (v) => isObject(v) && Object.values(v).every((x) => typeof x === "number" && x >= 0),
+  secretPaths: isStrings,
 };
 
 // The first problem in `value`, naming its key. Own keys only, so "toString" is unknown.
@@ -307,7 +372,8 @@ export function loadConfig(file = CONFIG_FILE): { config: Config; error?: string
   const given = raw as Partial<Record<keyof Config, unknown>>;
   config.decider = (given.decider as Decider[] | undefined) ?? [config.command.argv.length ? "command" : given.classifier ? "classifier" : "llm"];
   const { decider } = config;
-  if (decider.includes("llm") && decider.at(-1) !== "llm") return ignored('"llm" must be the last entry in "decider"');
+  if (decider.filter((d) => TERMINAL.includes(d)).length > 1) return ignored('"decider" may hold "llm" or "context", not both');
+  if (decider.some((d) => TERMINAL.includes(d)) && !TERMINAL.includes(decider.at(-1)!)) return ignored('"llm" or "context" must be the last entry in "decider"');
   if (decider.includes("command") && !config.command.argv.length) return ignored('"decider" has "command" and command.argv is empty');
   for (const stage of ["classifier", "command"] as const) {
     if (config[stage].allowBelow > config[stage].askAbove) return ignored(`${stage}.allowBelow is above ${stage}.askAbove`);
@@ -335,7 +401,7 @@ export function buildQuestions(config: Config, viaPi = Boolean(config.classifier
 }
 
 // The classifier to use when a caller names none: the first one in `decider`.
-const firstScorer = (config: Config): Scorer => (config.decider.find((d) => d !== "llm") as Scorer | undefined) ?? "classifier";
+const firstScorer = (config: Config): Scorer => (config.decider.find((d) => !TERMINAL.includes(d)) as Scorer | undefined) ?? "classifier";
 
 // The first question answered at or above its threshold, the main question first.
 export function flagged(config: Config, answers: Record<string, number>, stage = firstScorer(config)): string | undefined {
@@ -893,6 +959,80 @@ function log(config: Config, entry: Record<string, unknown>) {
 }
 
 // `overrides` is for test.mjs and bench/run.mjs; Pi calls this with one argument.
+// Integration points for a host extension, on globalThis so every copy of this module sees them:
+// `active` says whether this guard should judge calls now (for example only in an "auto" mode),
+// and `context` replaces how the context decider reaches its model.
+export interface ContextAnswer {
+  answers?: Record<string, number>;
+  error?: string;
+  ms?: number;
+}
+export interface Hooks {
+  active?: () => boolean;
+  context?: (state: Record<string, unknown>, questions: Record<string, object>, options: { provider: string; model: string; timeoutMs: number; signal?: AbortSignal }) => Promise<ContextAnswer>;
+}
+const g = globalThis as unknown as Record<symbol, Hooks | undefined>;
+export const hooks: Hooks = (g[Symbol.for("pi-automode-classifier.hooks")] ??= {});
+
+// The context decider through Pi's model registry: a classifier model such as
+// openrouter/typesafe/jev-1.14, with Pi's own credentials for that provider.
+export async function contextViaPi(config: Config, state: Record<string, unknown>, registry: Registry | undefined, signal?: AbortSignal): Promise<ContextAnswer> {
+  const c = config.context;
+  const started = performance.now();
+  const ms = () => Math.round(performance.now() - started);
+  const model = registry?.findOfType("classifier", c.provider, c.model);
+  if (!model) return { error: `Pi has no classifier model ${c.provider}/${c.model}`, ms: ms() };
+  // Pi calls a yes/no question "bool".
+  const questions = Object.fromEntries(Object.entries(CTX_QUESTIONS).map(([id, q]) => [id, { ...q, type: "bool" }]));
+  const timeout = AbortSignal.timeout(c.timeoutMs);
+  const result = await registry!.classify(model, { state, questions }, { signal: signal ? AbortSignal.any([signal, timeout]) : timeout });
+  if (timeout.aborted) return { error: `no answer in ${c.timeoutMs} ms`, ms: ms() };
+  if (result.stopReason !== "stop") return { error: clip(result.errorMessage ?? `${c.provider}/${c.model} gave no answer`, 200), ms: ms() };
+  const answers: Record<string, number> = {};
+  for (const id of Object.keys(questions)) {
+    const a = result.answers?.[id] as { probability?: number; noul?: number } | number | undefined;
+    const p = typeof a === "number" ? a : (a?.probability ?? a?.noul);
+    if (typeof p !== "number" || !(p >= 0 && p <= 1)) return { error: "invalid response from the model", ms: ms() };
+    answers[id] = p;
+  }
+  return { answers, ms: ms() };
+}
+
+// When the user's last message is a short reply ("yes u may do that"), the agent
+// message it answers, so Jev can tell what the yes approves. Undefined otherwise.
+const textOf = (content: unknown) =>
+  typeof content === "string" ? content : Array.isArray(content) ? content.filter((c) => c?.type === "text").map((c) => String(c.text ?? "")).join("\n") : "";
+export function replyTarget(entries: { message?: Record<string, unknown> }[]): string | undefined {
+  let lastAgent: string | undefined;
+  let target: string | undefined;
+  for (const { message: m } of entries) {
+    if (m?.role === "assistant") {
+      const t = textOf(m.content).trim();
+      if (t) lastAgent = t;
+    } else if (m?.role === "user") {
+      const t = ownWords(textOf(m.content)).trim();
+      if (!t) continue;
+      target = t.length <= SHORT_REPLY ? lastAgent : undefined;
+      lastAgent = undefined;
+    }
+  }
+  return target;
+}
+
+// two plain sentences on what a command does, for the confirm prompt. Undefined
+// when the explainer model is missing or slow: the prompt then shows the command alone.
+const EXPLAIN_SYSTEM =
+  "You explain shell commands to the person who must approve them. In at most two short, plain sentences say what the command does and what it changes, " +
+  "deletes, downloads or sends, and where (this machine, a named remote host, GitHub, the internet). No preamble, no markdown, no advice, no verdict.";
+export async function explain(config: Config, command: string, cwd: string, registry: ChatRegistry | undefined, signal?: AbortSignal, sessionModel?: unknown): Promise<string | undefined> {
+  const e = config.context.explainer;
+  const base = (e.provider || e.model ? registry?.find(e.provider, e.model) : sessionModel) as Record<string, unknown> | undefined;
+  if (!base) return undefined;
+  const resolved: Resolved = { model: { ...base, reasoning: false, maxTokens: 160 }, llm: { ...config.llm, timeoutMs: e.timeoutMs, thinkingLevel: "off" } };
+  const r = await askOnce(registry!, resolved, EXPLAIN_SYSTEM, `Working directory: ${cwd}\n\nCommand:\n${clip(redact(command).text, 4000)}`, { maxTokens: 160, thinking: false, signal });
+  return r.text ? clip(r.text.replace(/\s+/g, " "), 400) : undefined;
+}
+
 export default function (pi: ExtensionAPI, overrides: Partial<Config> = {}) {
   const loaded = loadConfig();
   const config = { ...loaded.config, ...overrides };
@@ -913,12 +1053,20 @@ export default function (pi: ExtensionAPI, overrides: Partial<Config> = {}) {
   let rules = compile();
   const allowedPaths = [...config.allowedPaths];
   const guarded = [...GUARDED, ...config.guardedPaths];
+  setSecretPaths(config.secretPaths.map((p) => (p === "~" || p.startsWith("~/") ? HOME + p.slice(1) : p)));
   let enabled = config.enabled;
   const counts = { rule: 0, model: 0, asked: 0, blocked: 0 };
   // Denials by the chat decider, the backstop Claude Code has for a pushed-or-compromised agent.
   const denials = { consecutive: 0, total: 0 };
   // Exact commands and paths the user allowed for the rest of the session.
   const sessionAllowed = new Set<string>();
+  // kinds of call (the rule's reason, like "runs code with python3") the user allowed
+  // for the session. Inline code differs on every call, so allowing only the exact text would
+  // ask again each time. A call of an allowed kind skips LANCET and runs unless Jev calls it
+  // harmful (context.sessionHarmBelow); root, credentials and the guard's files never get here.
+  const sessionKinds = new Set<string>();
+  // Auto-blocks since the last call that ran; see context.maxAutoBlocks.
+  let autoBlocks = 0;
   // Files the session wrote or downloaded, as far as the rules saw it.
   const files: SessionFiles = new Map();
   // Git checkouts per working directory, as they were when the session first used it. A worktree
@@ -945,7 +1093,8 @@ export default function (pi: ExtensionAPI, overrides: Partial<Config> = {}) {
   pi.on("session_shutdown", async () => stopClassifierProcess());
 
   pi.on("tool_call", async (event, ctx) => {
-    if (!enabled) return undefined;
+    // A host extension with its own permission modes can make this guard stand aside.
+    if (!enabled || (hooks.active && !hooks.active())) return undefined;
     const input = event.input as Record<string, unknown>;
     const now = checkouts(ctx.cwd);
     if (!repositories.has(ctx.cwd)) repositories.set(ctx.cwd, now);
@@ -959,7 +1108,7 @@ export default function (pi: ExtensionAPI, overrides: Partial<Config> = {}) {
       allowedPaths: [...allowedPaths, ...roots],
       files,
       project: (p) => inCheckout(p, roots),
-      chatDecider: config.decider.includes("llm"),
+      chatDecider: config.decider.some((d) => TERMINAL.includes(d)),
     });
     let subject: string;
     let verdict: Verdict;
@@ -979,7 +1128,10 @@ export default function (pi: ExtensionAPI, overrides: Partial<Config> = {}) {
 
     const entry: Record<string, unknown> = { tool: event.toolName, cwd: ctx.cwd, subject: clip(subject, 4000), rule: verdict.action, reason: verdict.reason };
     const finish = (outcome: string, by: string) => {
-      if (outcome === "allow") commitWrites(scope);
+      if (outcome === "allow") {
+        commitWrites(scope);
+        autoBlocks = 0;
+      }
       log(config, { ...entry, outcome, by });
     };
     const held = (outcome: Outcome) => {
@@ -999,6 +1151,74 @@ export default function (pi: ExtensionAPI, overrides: Partial<Config> = {}) {
     // the call runs. Two kinds of call skip the classifiers and go to the chat model: an ask from
     // the rules, and a call that runs files the session wrote. A classifier sees only the
     // command, so it cannot tell whether the user asked for it or what the file holds.
+    // rules, then LANCET, then Jev with the user's requests. A call runs when LANCET
+    // and Jev both call it routine, or when the user's own requests cover it. A rule ask (a push,
+    // ssh, sudo) and a file the session wrote skip LANCET, which only sees the command text, so
+    // only the user's requests can clear them. Any failure asks; it never allows.
+    // Plain root (not a credential read or a disk wipe) goes the same way when there is a UI: if
+    // the user asked for it and sudoPasswordIsApproval is on, sudo's password prompt is the approval.
+    const rootAsk = config.sudoPasswordIsApproval && config.decider.includes("context") && verdict.action === "ask" && verdict.critical && verdict.reason === "sudo runs as root" && ctx.hasUI;
+    if (rootAsk) verdict = { ...verdict, action: "classify", ruleAsk: true };
+    const ruleReason = verdict.reason;
+    let explainHarm: number | undefined;
+    const kindable = (v: Verdict) => config.decider.includes("context") && !v.critical && !v.locked && !v.firm && !!ruleReason;
+    if (verdict.action === "classify" && config.decider.includes("context")) {
+      const c = config.context;
+      const kind = kindable(verdict) && sessionKinds.has(ruleReason);
+      const steps: Record<string, unknown>[] = [];
+      entry.steps = steps;
+      let lancet: number | undefined;
+      if (!kind && !verdict.ruleAsk && !verdict.files && config.decider.includes("command")) {
+        const result = await classify(config, { tool: event.toolName, cwd: ctx.cwd, command: subject }, ctx.signal, ctx.modelRegistry as unknown as Registry, "command");
+        steps.push({ decider: "command", model: classifierName(config, "command"), ...result });
+        if ("answers" in result) lancet = result.answers.risky;
+        if (lancet !== undefined && lancet < config.command.allowBelow) {
+          counts.model++;
+          finish("allow", "command");
+          return undefined;
+        }
+      }
+      const branch = (ctx.sessionManager?.getBranch?.() ?? []) as { message?: Record<string, unknown> }[];
+      const requests = transcriptItems(branch, config.llm)
+        .filter((i) => i.kind === "user")
+        .map((i) => (i as { text: string }).text);
+      const state = contextState({ requests, replyTo: replyTarget(branch), tool: event.toolName, command: subject, cwd: ctx.cwd, inside: inCheckout(ctx.cwd, roots), note: verdict.reason });
+      const answer = hooks.context
+        ? await hooks.context(state, CTX_QUESTIONS, { provider: c.provider, model: c.model, timeoutMs: c.timeoutMs, signal: ctx.signal })
+        : await contextViaPi(config, state, ctx.modelRegistry as unknown as Registry, ctx.signal);
+      steps.push({ decider: "context", model: `${c.provider}/${c.model}`, ...answer });
+      const a = answer.answers;
+      if (!a) verdict = { ...verdict, action: "ask", reason: `${verdict.reason || "unknown command"}; Jev gave no answer (${answer.error})` };
+      else {
+        const routine = lancet !== undefined && lancet < config.command.askAbove && a.harmful! < c.allowHarmBelow;
+        const asked = a.authorized! >= c.authorizedAbove && a.harmful! < c.authorizedHarmBelow;
+        const allowedKind = kind && a.harmful! < c.sessionHarmBelow;
+        const harmless = !verdict.files && a.harmful! < c.lowHarmBelow;
+        const taskStep = !verdict.files && a.authorized! >= c.partialAuthorizedAbove && a.harmful! < c.partialHarmBelow;
+        if (routine || asked || allowedKind || harmless || taskStep) {
+          counts.model++;
+          finish("allow", asked ? "context-asked" : allowedKind ? "context-session-kind" : harmless ? "context-harmless" : taskStep ? "context-task-step" : "context-routine");
+          return undefined;
+        }
+        const pct = (x: number) => `${Math.round(x * 100)}%`;
+        if (a.authorized! < c.blockAuthorizedBelow && a.harmful! >= c.blockHarmAbove && autoBlocks < c.maxAutoBlocks) {
+          autoBlocks++;
+          counts.blocked++;
+          held("automode-blocked");
+          finish("block", "context-block");
+          if (ctx.hasUI) ctx.ui.notify(`Auto mode blocked ${event.toolName}: ${ruleReason || "unknown command"} (harm ${pct(a.harmful!)}, you asked for it ${pct(a.authorized!)})`, "warning");
+          return {
+            block: true,
+            reason:
+              `Auto mode blocked this: it looks harmful (${pct(a.harmful!)}) and the user's requests do not cover it (${pct(a.authorized!)}). ` +
+              "Do not retry it or work around it. If the task really needs it, tell the user in plain words what it would do and why, and ask them in chat; once they agree it will run.",
+          };
+        }
+        explainHarm = a.harmful!;
+        verdict = { ...verdict, action: "ask", reason: `${verdict.reason || "unknown command"}; Jev: you asked for it ${pct(a.authorized!)}, harm ${pct(a.harmful!)}${lancet !== undefined ? `, LANCET risk ${pct(lancet)}` : ""}` };
+      }
+    }
+
     let toLlm = false;
     if (verdict.action === "classify") {
       const chain = verdict.ruleAsk || verdict.files ? config.decider.filter((d) => d === "llm") : config.decider;
@@ -1109,15 +1329,21 @@ export default function (pi: ExtensionAPI, overrides: Partial<Config> = {}) {
 
     counts.asked++;
     // While the config file is ignored every prompt says so, since the defaults decide differently.
-    const title = `Auto mode: allow ${event.toolName}?\n${verdict.reason}\n\n${clip(subject, 1200)}${configError ? `\n\n${configError}` : ""}`;
+    const explanation = explainHarm !== undefined && explainHarm >= config.context.explainHarmAbove ? await explain(config, subject, ctx.cwd, ctx.modelRegistry as unknown as ChatRegistry, ctx.signal, ctx.model) : undefined;
+    const title = `Auto mode: allow ${event.toolName}?\n${verdict.reason}${explanation ? `\n\nWhat it does: ${explanation}` : ""}\n\n${clip(subject, 1200)}${configError ? `\n\n${configError}` : ""}`;
     // A change outside the working directory can be allowed for its whole folder, and a command
     // for its pattern, so the next one does not ask again. A folder and the pattern of a command
     // the rules do not know can also be saved to the config file.
     const dir = verdict.dir?.replace(HOME, "~");
     const covers = dir ? `changes in ${dir}` : verdict.pattern ? `"${verdict.pattern}"` : undefined;
-    const forSession = covers ? `Allow ${covers} for this session` : "Allow for this session";
+    const byKind = !covers && kindable(verdict);
+    const forSession = covers ? `Allow ${covers} for this session` : byKind ? `Allow "${ruleReason}" for this session (Jev still stops harmful ones)` : "Allow for this session";
     const always = covers && !(verdict.pattern && verdict.fromAsk) ? `Always allow ${covers}` : undefined;
-    const answer = prompts.then(() => ctx.ui.select(title, ["Allow once", forSession, ...(always ? [always] : []), "Block"], { signal: ctx.signal }));
+    // an unanswered prompt blocks after a while, so an away session moves on.
+    const envWait = Object.entries(config.envAskTimeouts).find(([name]) => process.env[name]);
+    const waitSeconds = envWait ? envWait[1] : config.askTimeoutSeconds;
+    const timeout = waitSeconds > 0 ? waitSeconds * 1000 : undefined;
+    const answer = prompts.then(() => ctx.ui.select(title, ["Allow once", forSession, ...(always ? [always] : []), "Block"], { signal: ctx.signal, timeout }));
     prompts = answer.catch(() => undefined);
     const choice = await answer;
     const wider = choice === forSession || (always !== undefined && choice === always);
@@ -1129,7 +1355,10 @@ export default function (pi: ExtensionAPI, overrides: Partial<Config> = {}) {
       } else if (verdict.pattern) {
         picked.push(verdict.pattern);
         pickedRules = compileRules({ allow: picked }).allow;
-      } else sessionAllowed.add(key);
+      } else {
+        sessionAllowed.add(key);
+        if (byKind) sessionKinds.add(ruleReason);
+      }
     }
     if (always !== undefined && choice === always) {
       const error = verdict.dir ? saveToConfig("allowedPaths", dir!) : saveToConfig("allow", verdict.pattern!);
@@ -1141,6 +1370,13 @@ export default function (pi: ExtensionAPI, overrides: Partial<Config> = {}) {
     }
     counts.blocked++;
     held("rejected-by-user");
+    if (choice === undefined && timeout && !ctx.signal?.aborted) {
+      finish("block", "timeout");
+      return {
+        block: true,
+        reason: `This needs the user's approval (${verdict.reason}) and nobody answered within ${waitSeconds} s: the user is probably away. Do not retry it or work around it. Carry on with the parts of the task that do not need it, then say what is waiting for approval.`,
+      };
+    }
     finish("block", "user");
     return { block: true, reason: `The user blocked this (${verdict.reason}). Do not retry it or work around it. Ask the user how to proceed.` };
   });

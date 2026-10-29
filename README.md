@@ -14,12 +14,67 @@ I built it because Pi runs every tool call without asking for approval, and I wa
 
 It is not a sandbox. It guards the agent's tool calls. It doesn't guard `!` commands you type, and extensions run with your user's permissions. Read [Pi's security docs](https://pi.dev/docs/latest/security) for real isolation.
 
+## This fork: a decider that knows what you asked for
+
+> Fork of [deepu105/pi-automode-classifier](https://github.com/deepu105/pi-automode-classifier) 0.3.0. Everything below this section is upstream's documentation and still applies.
+
+LANCET and the other stage-2 classifiers see only the command, so they cannot tell `rm -rf build/` you asked for from one you didn't. The chat decider can, but it is slow. This fork adds a `context` decider: [Jev](https://docs.typesafe.ai/api), a decision model, answers two typed questions in about a quarter second:
+
+- **authorized**: did your own requests ask for this action, including its destructive, remote or publishing part?
+- **harmful**: could it do harm that is hard to undo?
+
+It gets your last four messages and the pending command, and nothing else. It never gets tool output, file contents or the agent's prose, so text the agent read can't authorize anything. Tokens, keys and `password=` values are masked before anything is sent. When your last message is a short reply ("yes please do it"), it also gets the one agent message you were answering, so the yes approves exactly that proposal.
+
+```jsonc
+// ~/.pi/agent/extensions/pi-automode-classifier/config.json
+{ "decider": ["command", "context"] }   // LANCET first, then Jev; log in to OpenRouter with /login
+```
+
+How a call the rules leave open is decided (defaults):
+
+| Jev says | Result |
+|---|---|
+| asked for ≥ 60% | runs |
+| harm < 10% | runs |
+| asked for ≥ 25% and harm < 40% (a natural step of your task) | runs |
+| LANCET < 0.05 | runs |
+| asked for < 10% and harm ≥ 90% | **blocked without a prompt**; the agent is told to explain and ask you in chat. After 3 such blocks in a row the next one asks |
+| anything else, or any error or timeout | asks you |
+
+Other additions:
+
+- **Explanations on prompts.** For calls rated 25%+ harmful the prompt adds "What it does:", two plain sentences from a chat model (the session's own, or `context.explainer`). Secrets are masked first; if the model is slow or missing the prompt shows without it.
+- **Allow a kind of call for the session.** Inline scripts and ssh commands differ every time, so "allow this exact command" never matches again. The prompt offers "Allow *runs code with python3* for this session"; later calls of that kind run unless Jev rates them 50%+ harmful. Root, credential reads and the guard's own files are never covered.
+- **Prompt timeouts per environment.** `envAskTimeouts: {"TMUX": 300}` blocks an unanswered prompt after 5 minutes inside tmux, so an agent you left carries on with what it can.
+- **`secretPaths`** for your own credential files; reads always ask. Pi's `auth.json` and other agents' login files are built in.
+- **Bare `env` / `printenv`** now go to the decider instead of running, since they print every token in the environment.
+- **Hooks** (`hooks.active`, `hooks.context`, exported from `index.ts`) let a host extension with its own permission modes switch the guard off outside "auto", or route the context decider elsewhere.
+- **`sudoPasswordIsApproval`** (off by default): plain sudo you asked for goes to the decider instead of always asking. Turn it on only if sudo always asks for a password.
+
+### Benchmark
+
+`bench/context/` scores 1,192 commands (upstream's suites without `lancet-bench-1`, which LANCET trained on, plus two new ones) with the rules, LANCET Nano v0.4.3 and Jev 1.14. Thresholds were tuned on 40% of rows; the numbers are the other 60%. Nothing was executed.
+
+| Held-out | Risky calls that ran | Safe calls interrupted | Added latency p50 / p95 |
+|---|---:|---:|---|
+| Rules alone | 23/265 | 210/434 | 0 |
+| Rules + LANCET | 25/265 | 168/434 | 7 / 39 ms |
+| **Rules + LANCET + context** | 35/265 | 108/434 | 221 / 324 ms |
+
+On the suites that include your request, the context decider let 1 of 35 risky calls run (`scancel 4471` after "cancel my slurm job", arguably requested) and ran 40 of 60 safe ones, against 12 for rules + LANCET. Most of the other extra risky calls are GTFOBins shell-escape idioms from shellrisk (`pidstat -e /bin/sh`), which matter inside a sandbox. Of the 55 calls the block tier stopped without a prompt, 48 were risky.
+
+Caveats: `context-pairs` and `desktop-dev` are synthetic, written from one person's Pi use, and some rule gaps were fixed after seeing them. Usernames and hosts in them were replaced after scoring. Jev costs about $0.00002 per call (about 1¢ per 1,000 judged calls). `bench/context/RESULTS.md` has every table; `npm run bench:context` re-collects (needs `OPENROUTER_API_KEY` and LANCET installed; cached rows are skipped), and `node bench/context/rerule.ts && node bench/context/analyze.ts` re-scores after rule changes for free.
+
+Tests: `npm test` runs upstream's 634 cases plus `test-context.mjs`, which drives the decider with a scripted model so it needs no key or network.
+
 ## Install
 
 ```bash
 pi install npm:pi-automode-classifier
 # or straight from GitHub
 pi install git:github.com/deepu105/pi-automode-classifier
+# this fork
+pi install git:github.com/killianmiles27/pi-automode-classifier
 ```
 
 Or from a checkout: `pi install ./pi-automode-classifier`.

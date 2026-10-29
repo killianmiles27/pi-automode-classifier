@@ -311,11 +311,22 @@ const SECRET_PLACES = [
   /\/Library\/Keychains(\/|$)/,
   /^\/etc\/(g?shadow-?|ssl\/private(\/.*)?|ssh\/ssh_host_\w+_key)$/,
   /^\/proc\/[^/]+\/environ$/,
+  // Pi's logins and other coding agents' logins.
+  /\/\.pi\/agent\/(auth|mcp-auth|antigravity-accounts)\.json$/,
+  /\/\.(codex|claude)\/(auth|\.credentials)\.json$/,
+  /\/\.local\/share\/opencode\/auth\.json$/,
 ];
 const SECRET_NAMES =
   /^(id_(rsa|dsa|ecdsa|ed25519)(_[\w.-]+)?|.+\.(pem|key|p12|pfx|jks|keystore|kdbx)|\.env(\.[\w.-]+)?|credentials\.(json|ya?ml|toml|ini|csv|xml)|secrets?\.(json|ya?ml|toml|ini|env|txt)|.*service[-_]?(account|principal).*\.json|\.(netrc|npmrc|pypirc|git-credentials|vault-token|pgpass|htpasswd)|\.(bash|zsh)_history|.*\.keychain(-db)?)$/i;
 
+// Your own credential files and folders: the config's secretPaths, absolute.
+let extraSecrets: string[] = [];
+export function setSecretPaths(paths: string[]) {
+  extraSecrets = paths.map((p) => p.replace(/\/+$/, "")).filter(Boolean);
+}
+
 function isSecretPath(p: string): boolean {
+  if (extraSecrets.some((s) => p === s || p.startsWith(s + "/"))) return true;
   const name = path.basename(p);
   // Public keys, host lists, client settings, env templates and certificates hold nothing secret.
   if (/\.pub$|^known_hosts|^authorized_keys$|^\.env\.(example|sample|template|dist|defaults?)$/i.test(name)) return false;
@@ -565,7 +576,7 @@ export function parse(command: string, depth = 0): Parsed {
 
 // ---- command tables ----
 
-const READ_ONLY = new Set(
+export const READ_ONLY = new Set(
   `ls cat bat head tail less more wc rg grep egrep fgrep fd tree stat file du df pwd echo printf
    which whereis type whoami id groups date cal uname hostname uptime printenv ps pgrep free nproc
    lscpu lsblk lsusb lspci lsmod findmnt readlink realpath basename dirname sort uniq cut tr jq yq
@@ -998,6 +1009,9 @@ function command(cmd: Simple, scope: Scope, depth: number): Verdict {
   if (["export", "declare", "typeset", "readonly"].includes(argv[0])) assigned.push(...argv.slice(1));
   const loader = assigned.map((w) => LOADS_CODE.exec(w)).find((m) => m && (m[1] !== "NODE_OPTIONS" || NODE_LOADS.test(m[2])));
   if (loader) verdict = classify(`sets ${loader[1]}, which loads other code into the program`);
+  // `env` or `printenv` on their own print every variable, and tokens often live there.
+  const bareEnv = cmd.argv.length && path.basename(cmd.argv[0]) === "env" && cmd.argv.slice(1).every((w) => w.startsWith("-") || /^[A-Za-z_][A-Za-z0-9_]*=/.test(w));
+  if (bareEnv || (path.basename(argv[0] ?? "") === "printenv" && argv.length === 1)) return worst(verdict, classify("prints environment variables, which can hold tokens"));
   if (!argv.length) return verdict;
 
   const name = path.basename(argv[0]);
