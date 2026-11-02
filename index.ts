@@ -460,7 +460,7 @@ async function startServer(config: Config, waitMs: number): Promise<boolean> {
   const { startCommand } = config.classifier;
   if (!startCommand.length || Date.now() - lastStart < 30_000) return false;
   lastStart = Date.now();
-  spawn(startCommand[0], startCommand.slice(1), { stdio: "ignore", detached: true })
+  spawn(startCommand[0], startCommand.slice(1), { stdio: "ignore", detached: true, windowsHide: true })
     .on("error", () => {})
     .unref();
   for (const deadline = Date.now() + waitMs; Date.now() < deadline; ) {
@@ -498,7 +498,7 @@ export function stopClassifierProcess() {
 
 function startClassifierProcess(command: string[]): ClassifierProcess {
   const [program, ...args] = command.map((word) => (word.startsWith("~/") ? HOME + word.slice(1) : word));
-  const child = spawn(program, args, { stdio: ["pipe", "pipe", "ignore"] });
+  const child = spawn(program, args, { stdio: ["pipe", "pipe", "ignore"], windowsHide: true });
   const started: ClassifierProcess = { key: command.join("\0"), child, buffer: "" };
   const deliver = (line: string | undefined) => {
     const waiting = started.waiting;
@@ -817,14 +817,15 @@ function fileContents(paths: string[]): Record<string, string> {
 
 function git(dir: string, ...args: string[]): string | undefined {
   try {
-    return execFileSync("git", ["-C", dir, ...args], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], timeout: 2000 });
+    return execFileSync("git", ["-C", dir, ...args], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"], timeout: 2000, windowsHide: true });
   } catch {
     return undefined;
   }
 }
 const realpath = (p: string) => {
   try {
-    return fs.realpathSync.native(p);
+    const resolved = fs.realpathSync.native(p);
+    return process.platform === "win32" ? resolved.replace(/\\/g, "/") : resolved;
   } catch {
     return p;
   }
@@ -1053,8 +1054,14 @@ export default function (pi: ExtensionAPI, overrides: Partial<Config> = {}) {
   let rules = compile();
   const allowedPaths = [...config.allowedPaths];
   const guarded = [...GUARDED, ...config.guardedPaths];
-  setSecretPaths(config.secretPaths.map((p) => (p === "~" || p.startsWith("~/") ? HOME + p.slice(1) : p)));
+  setSecretPaths(["auth.json", "mcp-auth.json", "antigravity-accounts.json"].map((name) => path.join(AGENT_DIR, name)).concat(config.secretPaths.map((p) => (p === "~" || p.startsWith("~/") ? HOME + p.slice(1) : p))));
   let enabled = config.enabled;
+  const publishMode = (ctx: ExtensionContext) => ctx.ui.setStatus?.("pi-mode", enabled ? "AUTO" : "YOLO");
+  const setMode = (auto: boolean, ctx: ExtensionContext) => {
+    enabled = auto;
+    if (!auto) stopClassifierProcess();
+    publishMode(ctx);
+  };
   const counts = { rule: 0, model: 0, asked: 0, blocked: 0 };
   // Denials by the chat decider, the backstop Claude Code has for a pushed-or-compromised agent.
   const denials = { consecutive: 0, total: 0 };
@@ -1079,6 +1086,8 @@ export default function (pi: ExtensionAPI, overrides: Partial<Config> = {}) {
   let prompts: Promise<unknown> = Promise.resolve();
 
   pi.on("session_start", async (_event, ctx) => {
+    enabled = config.enabled;
+    publishMode(ctx);
     if (configError && ctx.hasUI) ctx.ui.notify(`pi-automode-classifier: ${configError}`, "warning");
     // Warm the server in the background so the first classified call does not wait for it. The
     // chat decider takes its place, so then it is not needed.
@@ -1114,7 +1123,9 @@ export default function (pi: ExtensionAPI, overrides: Partial<Config> = {}) {
     let verdict: Verdict;
     if (typeof input.command === "string") {
       subject = input.command;
-      verdict = bashVerdict(subject, scope);
+      verdict = event.toolName === "powershell"
+        ? { action: "ask", reason: "PowerShell requires review; automatic rules parse Bash", firm: true, critical: true }
+        : bashVerdict(subject, scope);
     } else if ((event.toolName === "write" || event.toolName === "edit") && typeof input.path === "string") {
       subject = input.path;
       verdict = fileVerdict(event.toolName, subject, scope);
@@ -1334,7 +1345,7 @@ export default function (pi: ExtensionAPI, overrides: Partial<Config> = {}) {
     // A change outside the working directory can be allowed for its whole folder, and a command
     // for its pattern, so the next one does not ask again. A folder and the pattern of a command
     // the rules do not know can also be saved to the config file.
-    const dir = verdict.dir?.replace(HOME, "~");
+    const dir = verdict.dir?.replace(/\\/g, "/").replace(HOME.replace(/\\/g, "/"), "~");
     const covers = dir ? `changes in ${dir}` : verdict.pattern ? `"${verdict.pattern}"` : undefined;
     const byKind = !covers && kindable(verdict);
     const forSession = covers ? `Allow ${covers} for this session` : byKind ? `Allow "${ruleReason}" for this session (Jev still stops harmful ones)` : "Allow for this session";
@@ -1381,17 +1392,40 @@ export default function (pi: ExtensionAPI, overrides: Partial<Config> = {}) {
     return { block: true, reason: `The user blocked this (${verdict.reason}). Do not retry it or work around it. Ask the user how to proceed.` };
   });
 
+  pi.registerCommand("mode", {
+    description: "Permission mode: auto (rules + LANCET + Jev) or yolo (guard off)",
+    getArgumentCompletions: (prefix) => ["auto", "yolo"].filter((a) => a.startsWith(prefix)).map((value) => ({ value, label: value })),
+    handler: async (args, ctx) => {
+      let mode = args.trim().toLowerCase();
+      if (!mode) {
+        const choice = await ctx.ui.select("Permission mode", ["Auto — rules, LANCET and Jev check tool calls", "YOLO — run without this guard's approval checks"]);
+        if (!choice) return;
+        mode = choice.startsWith("Auto") ? "auto" : "yolo";
+      }
+      if (mode !== "auto" && mode !== "yolo") return ctx.ui.notify("Use /mode auto or /mode yolo", "warning");
+      setMode(mode === "auto", ctx);
+      ctx.ui.notify(mode === "auto" ? "Auto mode: permission checks enabled." : "YOLO mode: this session's permission guard is off. /mode auto restores it.", "info");
+    },
+  });
+  pi.registerShortcut?.("alt+m", {
+    description: "Toggle Auto / YOLO for this session",
+    handler: async (ctx) => {
+      setMode(!enabled, ctx);
+      ctx.ui.notify(enabled ? "Auto mode" : "YOLO mode — guard off", "info");
+    },
+  });
   pi.registerCommand("automode-classifier", {
     description: "Auto mode guard: status | on | off",
     getArgumentCompletions: (prefix) => ["status", "on", "off"].filter((a) => a.startsWith(prefix)).map((a) => ({ value: a, label: a })),
     handler: async (args, ctx: ExtensionContext) => {
       const arg = args.trim();
-      if (arg === "on" || arg === "off") enabled = arg === "on";
+      if (arg === "on" || arg === "off") setMode(arg === "on", ctx);
       else if (arg && arg !== "status") return ctx.ui.notify("Usage: /automode-classifier status | on | off", "warning");
       const { llm, classifier, command } = config;
       // What a classifier sends to the next decider.
       const passes = (stage: Scorer, i: number) => (i < config.decider.length - 1 ? `; ${config[stage].allowBelow} to ${config[stage].askAbove} goes to the next decider` : "");
       const describe = async (stage: Decider, i: number) => {
+        if (stage === "context") return `context decider ${config.context.provider}/${config.context.model} through Pi (checks your requests and the command; asks if unavailable)`;
         if (stage === "llm") {
           const lists = mergeRules(DEFAULT_RULES, llm.prompt);
           return (

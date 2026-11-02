@@ -2,4 +2,10 @@ node_modules/
 *.tgz
 # machine config lives in ~/.pi/agent/extensions/pi-automode-classifier/
 config.json
+auth.json
+.env
+.env.*
+*.log
+decisions.jsonl
+coverage/
 bench/results/

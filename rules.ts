@@ -53,6 +53,17 @@ export interface Verdict {
 }
 
 const HOME = os.homedir();
+const slash = (p: string) => p.replace(/\\/g, "/");
+const GIT_ROOT = process.platform === "win32" ? [process.env.ProgramFiles, process.env["ProgramFiles(x86)"]]
+  .filter((p): p is string => !!p).map((p) => path.join(p, "Git")).find((p) => fs.existsSync(path.join(p, "bin", "bash.exe"))) : undefined;
+function shellPath(word: string): string {
+  if (process.platform !== "win32") return word;
+  if (/^\/(?:mnt\/)?[a-z](?:\/|$)/i.test(word)) return word.replace(/^\/(?:mnt\/)?([a-z])(?:\/|$)/i, (_match, drive) => `${drive}:/`);
+  if (/^\/dev\//.test(word)) return word;
+  if (/^\/tmp(?:\/|$)/.test(word)) return path.join(os.tmpdir(), word.slice(4));
+  if (GIT_ROOT && word.startsWith("/") && !word.startsWith("//")) return path.join(GIT_ROOT, word.slice(1));
+  return word;
+}
 const RANK: Record<Action, number> = { allow: 0, classify: 1, ask: 2, deny: 3 };
 function worst(...verdicts: Verdict[]): Verdict {
   const hold = (v: Verdict) => (v.locked ? 3 : v.critical ? 2 : v.firm ? 1 : 0);
@@ -96,7 +107,7 @@ export function within(p: string, dir: string, strict = false): boolean {
   return rel !== ".." && !rel.startsWith(".." + path.sep) && !path.isAbsolute(rel);
 }
 
-const TMP_DIRS = [...new Set(["/tmp", "/var/tmp", os.tmpdir()].map(realish))];
+const TMP_DIRS = [...new Set(["/tmp", "/var/tmp", os.tmpdir()].map((p) => realish(shellPath(p))))];
 const DEV_SINKS = /^\/dev\/(null|zero|stdout|stderr|tty|fd\/\d+)$/;
 
 // Where the content of a file written in this session came from: the agent itself (write tool,
@@ -223,6 +234,11 @@ const expandVars = (word: string, scope: Scope) => word.replace(/\$\{(\w+)\}|\$(
 function resolveWord(word: string, scope: Scope): string | undefined {
   word = expandVars(word, scope);
   if (/[$`]/.test(word)) return undefined;
+  if (process.platform === "win32") {
+    // Git Bash drive paths refer to Windows files, not a folder on the current drive.
+    word = shellPath(word);
+    if (/^\/dev\//.test(word)) return word;
+  }
   if (word === "~" || word.startsWith("~/")) word = HOME + word.slice(1);
   else if (word.startsWith("~")) return undefined;
   if (!path.isAbsolute(word)) {
@@ -238,14 +254,18 @@ const isGuarded = (p: string | undefined, scope: Scope) => !!p && scope.guarded.
 // in every directory. A change to them changes what later sessions do, so it asks you, also with
 // the chat decider. Your own allow rules can replace that ask.
 const CONTEXT_FILES = new Set(["AGENTS.md", "AGENTS.override.md", "AGENTS.MD", "CLAUDE.md", "CLAUDE.MD"]);
-const isPiFile = (p: string | undefined, scope: Scope) => !!p && (p.split("/").includes(".pi") || CONTEXT_FILES.has(path.basename(p)) || scope.piDirs.some((d) => within(p, d)));
+const isPiFile = (p: string | undefined, scope: Scope) => !!p && (p.split(/[\\/]/).some((part) => process.platform === "win32" ? part.toLowerCase() === ".pi" : part === ".pi") || CONTEXT_FILES.has(path.basename(p)) || (process.platform === "win32" && /^(agents(?:\.override)?|claude)\.md$/i.test(path.basename(p))) || scope.piDirs.some((d) => within(p, d)));
 const piAsk = (reason: string): Verdict => ({ action: "ask", reason, firm: true });
 const inTmp = (p: string) => TMP_DIRS.some((d) => within(p, d, true));
 // Provably inside the project or a temp directory.
 const isLocal = (p: string | undefined, scope: Scope) =>
   !!p && ((!!scope.root && within(p, scope.root)) || inTmp(p) || scope.allowed.some((d) => within(p, d)));
 // /, a top-level directory, $HOME or a parent of it.
-export const isRootLike = (p: string) => p === "/" || path.dirname(p) === "/" || within(HOME, p);
+export const isRootLike = (p: string) => p === "/" || path.dirname(p) === "/" || within(HOME, p) || (process.platform === "win32" && (
+  path.resolve(p) === path.parse(path.resolve(p)).root ||
+  path.dirname(path.resolve(p)) === path.parse(path.resolve(p)).root ||
+  [process.env.SystemRoot, process.env.ProgramFiles, process.env["ProgramFiles(x86)"], process.env.ProgramData].some((d) => !!d && within(p, d))
+));
 const BARE_GLOB = /^(\*|\.\*|\.\[!\.\]\*|\{.*\})$/;
 
 // The folder a session permission for `p` would cover: the git checkout or worktree it is in,
@@ -326,13 +346,14 @@ export function setSecretPaths(paths: string[]) {
 }
 
 function isSecretPath(p: string): boolean {
-  if (extraSecrets.some((s) => p === s || p.startsWith(s + "/"))) return true;
+  if (process.platform === "win32") p = slash(p).toLowerCase();
+  if (extraSecrets.some((s) => { if (process.platform === "win32") s = slash(s).toLowerCase(); return p === s || p.startsWith(s + "/"); })) return true;
   const name = path.basename(p);
   // Public keys, host lists, client settings, env templates and certificates hold nothing secret.
   if (/\.pub$|^known_hosts|^authorized_keys$|^\.env\.(example|sample|template|dist|defaults?)$/i.test(name)) return false;
   if (/\/\.(ssh|aws)\/config$/.test(p)) return false;
   if (/cert|chain|public|(^|[._-])ca([._-]|$)/i.test(name) && !/priv|key/i.test(name.replace(/\.key$/i, ""))) return false;
-  return SECRET_PLACES.some((place) => place.test(p)) || SECRET_NAMES.test(name);
+  return SECRET_PLACES.some((place) => place.test(p) || (process.platform === "win32" && place.test(p.replace(/^[a-z]:/i, "")))) || SECRET_NAMES.test(name);
 }
 
 // The credential file a shell word names, if any. Handles `--file=path`, curl's `@file` and
@@ -752,7 +773,7 @@ function rm(args: string[], scope: Scope): Verdict {
     if (isGuarded(p, scope)) verdict = worst(verdict, guardAsk("rm deletes the auto-mode guard's own files"));
     else if (isPiFile(p, scope)) verdict = worst(verdict, piAsk(`rm deletes Pi's own files: ${t}`));
     else if (!isLocal(p, scope)) verdict = worst(verdict, outside(`rm deletes outside the working directory: ${t}`, p));
-    else if (recursive && scope.root && (p === scope.root || (bare && path.dirname(p!) === scope.root) || /(^|\/)\.git(\/|$)/.test(p!))) {
+    else if (recursive && scope.root && (p === scope.root || (bare && path.dirname(p!) === scope.root) || /(^|[\\/])\.git([\\/]|$)/i.test(p!))) {
       verdict = worst(verdict, ask(`rm -r of ${t} deletes the whole project or its git data`));
     }
   }
@@ -1017,6 +1038,9 @@ function command(cmd: Simple, scope: Scope, depth: number): Verdict {
   const name = path.basename(argv[0]);
   const args = argv.slice(1);
 
+  // Bash's parser cannot determine the semantics of another shell's inline code.
+  if (/^(powershell|pwsh|cmd)(\.exe)?$/i.test(name)) return criticalAsk("runs Windows shell code; review the full command");
+
   if (["case", "function", "select", "source", ".", "trap", "alias"].includes(name)) return worst(verdict, classify(`shell ${name}`));
   if (/^mkfs(\.|$)/.test(name) || name === "wipefs") return deny(`${name} formats a disk`);
 
@@ -1188,7 +1212,8 @@ function evaluateParsed(parsed: Parsed, scope: Scope, depth: number): Verdict {
     for (const [name, value] of (track && !cmd.subshell && assignments(cmd.argv)) || []) {
       // A relative value is resolved where it is used, after any later `cd`, so only absolute
       // ones are followed.
-      const p = /^(\/|~\/|~$)/.test(expandVars(value, local)) ? resolveWord(value, local) : undefined;
+      const expanded = expandVars(value, local);
+      const p = (/^(\/|~\/|~$)/.test(expanded) || path.isAbsolute(expanded)) ? resolveWord(value, local) : undefined;
       if (p && namedOnce(name)) local.vars!.set(name, p);
     }
   }

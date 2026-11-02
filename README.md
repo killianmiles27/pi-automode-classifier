@@ -83,6 +83,28 @@ That is all the default needs: stages 1 and 3, with the session's own model as s
 
 In a session, `/automode-classifier off` turns the guard off, `on` turns it back, and `status` shows the state, the decider, your rule counts and the counts for the session.
 
+## Native Windows (0.5.0)
+
+Use native Pi with Git for Windows installed in its standard location. Install this fork with `pi install git:github.com/killianmiles27/pi-automode-classifier`. The extension contains no bundled Pi executable, model, API key, or machine-specific configuration.
+
+- `/mode` opens the Auto/YOLO selector; `/mode auto` and `/mode yolo` switch directly. **Alt+M** toggles them. The status shows `AUTO` or `YOLO`.
+- Auto applies the guard. YOLO bypasses this extension's checks and stops its local classifier process. Other host permissions still apply. Switching is session-only: a new session restores `enabled` from your configuration (Auto by default).
+- Windows drive roots, system directories, credential paths, custom Pi agent directories, and standard Git Bash path mappings are handled explicitly. PowerShell tool calls and nested PowerShell/cmd commands require review: the deterministic shell parser understands Bash, not PowerShell.
+- Helper processes use hidden windows. Each Pi session owns its classifier process, starts it on demand, and stops it on normal session shutdown. Multiple Pi sessions can run independently; each active classifier uses its own memory.
+
+To use the OpenCode context decider, log in to OpenCode with Pi's `/login` and select that provider in the extension's `config.json`:
+
+```json
+{
+  "decider": "context",
+  "context": { "provider": "opencode", "model": "jev-1.13-free" }
+}
+```
+
+Model availability depends on the provider. To use LANCET before Jev, set `decider` to `["command", "context"]` and configure `command.argv` with your own Python executable, classifier script, and model paths as described below. Use JSON forward slashes or escaped backslashes in Windows paths. No shared server or background service is required for the command classifier.
+
+For development, use Node 24 and run `npm test` and `npm run test:windows`. These tests use isolated fixtures and mock model responses; no API keys or model downloads are needed. GitHub Actions runs the core suite on Windows and Linux, plus the Windows path regressions on Windows.
+
 ## Security
 
 Each stage checks something the others can't, and the hard limits sit in the stage no model can be talked out of:

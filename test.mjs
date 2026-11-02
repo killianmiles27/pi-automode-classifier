@@ -11,11 +11,13 @@ import path from "node:path";
 process.env.PI_CODING_AGENT_DIR = fs.mkdtempSync(path.join(os.tmpdir(), "pi-automode-classifier-test-"));
 const { bashVerdict, compileRules, fileVerdict, makeScope } = await import("./rules.ts");
 
-const home = os.homedir();
+const home = os.homedir().replace(/\\/g, "/");
+const fixtures = process.env.PI_TEST_FIXTURES ?? os.homedir();
+fs.mkdirSync(fixtures, { recursive: true });
 // Does not need to exist. It must not be under a temp directory, which the rules treat as scratch space.
 const project = path.join(home, "pi-automode-classifier-test-project");
-const guard = import.meta.dirname;
-const settings = path.join(home, ".pi/agent/settings.json");
+const guard = import.meta.dirname.replace(/\\/g, "/");
+const settings = path.join(home, ".pi/agent/settings.json").replace(/\\/g, "/");
 const scope = (cwd = project, options) => makeScope(cwd, [guard, settings], options);
 
 let failures = 0;
@@ -253,7 +255,7 @@ const merged = loads("valid config merges over defaults", { rules: { allow: ["gi
 check("x", { action: merged.classifier.askAbove === 0.3 && merged.rules.deny.length === 0 && merged.classifier.question === DEFAULTS.classifier.question && merged.llm.transcript.maxChars === DEFAULTS.llm.transcript.maxChars ? "x" : "bad merge" }, "config: nested defaults kept");
 {
   // config.example.jsonc lists every key at its default, so it must load and match DEFAULTS.
-  const example = fs.readFileSync(path.join(import.meta.dirname, "config.example.jsonc"), "utf8").replace(/^\s*\/\/.*\n/gm, "");
+  const example = fs.readFileSync(path.join(import.meta.dirname, "config.example.jsonc"), "utf8").replace(/^\s*\/\/.*\r?\n/gm, "");
   const loaded = loads("config.example.jsonc loads", example);
   const keys = (o) => (o && typeof o === "object" && !Array.isArray(o) ? Object.keys(o).sort().map((k) => [k, keys(o[k])]) : 0);
   check("x", { action: JSON.stringify(keys(JSON.parse(example))) === JSON.stringify(keys(DEFAULTS)) && JSON.stringify(loaded) === JSON.stringify(DEFAULTS) ? "x" : "differs" }, "config: config.example.jsonc has every key, at its default");
@@ -378,7 +380,7 @@ flag("flag", { risky: 0.1, prod: 0.6, secrets: 0 });
 flag("flag", { risky: 0.1, prod: 0.5, secrets: 0.2 });
 
 // Asks for changes outside the working directory name the folder a session permission would cover.
-const dirOf = (verdict) => verdict.dir?.replace(home, "~");
+const dirOf = (verdict) => verdict.dir?.replace(/\\/g, "/").replace(home, "~");
 const folder = (want, verdict, label) => check("x", { action: dirOf(verdict) === want ? "x" : `dir=${dirOf(verdict)}` }, `folder: ${label}`);
 folder("~/other-project/src", fileVerdict("write", "~/other-project/src/a.ts", scope()), "write outside names the parent folder");
 folder("~/other-project", bashVerdict("rm -rf ~/other-project/build", scope()), "rm outside names the parent folder");
@@ -386,9 +388,9 @@ folder("~/other-project", bashVerdict("echo hi > ~/other-project/notes.txt", sco
 folder(undefined, fileVerdict("write", "~/.bashrc", scope()), "$HOME itself is never offered");
 folder(undefined, fileVerdict("write", "/etc/hosts", scope()), "a system directory is never offered");
 folder(undefined, bashVerdict("git push", scope()), "other asks have no folder");
-const worktree = fs.mkdtempSync(path.join(home, ".pi-automode-classifier-test-worktree-"));
+const worktree = fs.mkdtempSync(path.join(fixtures, ".pi-automode-classifier-test-worktree-")).replace(/\\/g, "/");
 fs.writeFileSync(path.join(worktree, ".git"), "gitdir: elsewhere\n");
-folder(worktree.replace(home, "~"), fileVerdict("edit", path.join(worktree, "src/deep/a.ts"), scope()), "a file in a git worktree names the worktree root");
+folder(worktree.replace(/\\/g, "/").replace(home, "~"), fileVerdict("edit", path.join(worktree, "src/deep/a.ts"), scope()), "a file in a git worktree names the worktree root");
 
 // Shell forms that run nothing risky, and tools with read-only subcommands.
 bash("allow", "command -v llama-server");
@@ -492,7 +494,7 @@ pattern(undefined, "mytool sync && sudo true");
 const { checkouts, inCheckout, stopClassifierProcess, CONFIG_FILE } = await import("./index.ts");
 const { commitWrites } = await import("./rules.ts");
 const { execFileSync } = await import("node:child_process");
-const repo = fs.mkdtempSync(path.join(home, ".pi-automode-classifier-test-repo-"));
+const repo = fs.mkdtempSync(path.join(fixtures, ".pi-automode-classifier-test-repo-")).replace(/\\/g, "/");
 const linked = `${repo}-linked`;
 const sh = (cwd, ...argv) => execFileSync(argv[0], argv.slice(1), { cwd, stdio: "ignore" });
 const commit = (cwd) => sh(cwd, "git", "-c", "user.email=t@example.com", "-c", "user.name=t", "commit", "-qm", "init");
@@ -609,7 +611,7 @@ await handle("block", "user ask rule", "bash", { command: "niri msg output eDP-1
 await handle("run", "user allow rule", "bash", { command: "git push origin main" }, false);
 await handle("block", "guardedPaths entry", "bash", { command: "cat x > ~/guarded-by-config/unit.service" }, false);
 // Allowing a folder for the session: other files in it run without a prompt, other folders still ask.
-const folderOption = `Allow changes in ${worktree.replace(home, "~")} for this session`;
+const folderOption = `Allow changes in ${worktree.replace(/\\/g, "/").replace(home, "~")} for this session`;
 await handle("run", "write in a worktree, folder allowed for the session", "write", { path: path.join(worktree, "src/a.ts"), content: "" }, true, folderOption);
 check("x", { action: offered.at(-1)[1] === folderOption ? "x" : `offered ${offered.at(-1)[1]}` }, "handler: the prompt offers the worktree folder");
 await handle("run", "another file in that folder, no prompt", "edit", { path: path.join(worktree, "tests/deep/b.ts") }, true);
@@ -618,7 +620,7 @@ await handle("block", "a different outside folder still asks", "write", { path: 
 await handle("block", "a remote action still asks after a folder was allowed", "bash", { command: "gh release create v1" }, false);
 {
   // Worktrees added after the session first ran a command there.
-  const box = fs.mkdtempSync(path.join(home, ".pi-automode-classifier-test-late-"));
+  const box = fs.mkdtempSync(path.join(fixtures, ".pi-automode-classifier-test-late-")).replace(/\\/g, "/");
   const main = path.join(box, "main");
   fs.mkdirSync(main);
   sh(main, "git", "init", "-q", "-b", "main");
@@ -1054,7 +1056,7 @@ const llmHandler = (over, replies, top = {}) => {
   check("x", { action: first === undefined && again === undefined && h.sent.length === sentBefore ? "x" : `${JSON.stringify(first)} sent ${h.sent.length - sentBefore}` }, "handler llm: a call the user allowed for the session skips the decider");
 }
 {
-  const dir = fs.mkdtempSync(path.join(home, "amc-llm-"));
+  const dir = fs.mkdtempSync(path.join(fixtures, "amc-llm-")).replace(/\\/g, "/");
   const script = path.join(dir, "amc-authored.py");
   fs.writeFileSync(script, "import os  # authored marker\n");
   const h = llmHandler({}, [asst("<block>no</block>")]);

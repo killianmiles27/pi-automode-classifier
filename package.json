@@ -1,6 +1,6 @@
 {
   "name": "pi-automode-classifier",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "description": "Auto mode for Pi: rules, a local classifier, then a decider that checks whether you asked for the call",
   "keywords": [
     "pi-package",
@@ -32,10 +32,12 @@
     "systemd",
     "lancet",
     "README.md",
+    "CHANGELOG.md",
     "LICENSE"
   ],
   "scripts": {
-    "test": "node test.mjs && node test-context.mjs",
+    "test": "node test.mjs && node test-context.mjs && node test-modes.mjs",
+    "test:windows": "node test-windows.mjs",
     "bench": "node bench/run.mjs --stages classifier",
     "bench:llm": "node bench/run.mjs --stages llm --suites user-requests,bench-llm-cases",
     "bench:flow": "node bench/run.mjs --stages flow",
