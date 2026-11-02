@@ -1,6 +1,6 @@
 {
   "name": "pi-automode-classifier",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "description": "Auto mode for Pi: rules, a local classifier, then a decider that checks whether you asked for the call",
   "keywords": [
     "pi-package",

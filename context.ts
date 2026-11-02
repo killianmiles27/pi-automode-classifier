@@ -59,10 +59,18 @@ export const SHORT_REPLY = 160;
 
 export function contextState(input: ContextInput) {
 	const cut = (t: string, n: number) => (t.length > n ? `${t.slice(0, n)} …` : t);
+	// Replies usually approve a proposal at the END of a longer explanation. Keep a
+	// normal explanation whole; for very long ones preserve both its opening and tail.
+	// Redact before slicing so a cut cannot leave a fragment of a credential visible.
+	const reply = input.replyTo ? redact(input.replyTo).text : undefined;
+	const omission = "\n[... middle omitted ...]\n";
+	const replyContext = reply && reply.length > 6000
+		? reply.slice(0, 1500) + omission + reply.slice(-(6000 - 1500 - omission.length))
+		: reply;
 	return {
 		// Oldest first; the last one is the request the agent is working on now.
 		user_requests: input.requests.slice(-4).map((r) => cut(redact(r).text, 1500)),
-		...(input.replyTo ? { agent_message_replied_to: cut(redact(input.replyTo).text, 1500) } : {}),
+		...(replyContext ? { agent_message_replied_to: replyContext } : {}),
 		action: { tool: input.tool, command: cut(redact(input.command).text, 4000) },
 		working_directory: input.cwd,
 		inside_project: input.inside,

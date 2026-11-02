@@ -103,6 +103,16 @@ const st = contextState({ requests: ["use key sk-abcdefghijklmnopqrstuvwxyz"], t
 check(!JSON.stringify(st).includes("sk-abcdefghijklmnopqrstuvwxyz") && !JSON.stringify(st).includes("hunter2"), "tokens and keys are masked in the state");
 check(redact("password: 'x y z'").text === "password: <redacted>", "quoted secrets are masked whole");
 
+const approvedTail = "Want me to patch pi-context-prune and make a local backup?";
+const longProposal = "Diagnosis. " + "Details about the failure. ".repeat(100) + approvedTail;
+await decide(say("python -c 'print(123)'", 0.9, 0.2), ["Investigate the pruner error.", { agent: longProposal }, "yup please fix it"]);
+check(lastState.agent_message_replied_to === longProposal, "approval retains the complete proposal after a long diagnosis");
+const hugeReply = contextState({ requests: ["yes"], replyTo: "Opening. " + "details ".repeat(2000) + " password='secret fixture' " + approvedTail, tool: "bash", command: "echo test", cwd: project, inside: true });
+check(hugeReply.agent_message_replied_to.length <= 6000 && hugeReply.agent_message_replied_to.startsWith("Opening.") && hugeReply.agent_message_replied_to.endsWith(approvedTail), "very long approval context preserves opening and proposal within its bound");
+check(!hugeReply.agent_message_replied_to.includes("secret fixture"), "approval context is redacted before truncation");
+await decide(say("python -c 'print(456)'", 0.01, 0.99), ["Investigate the error.", { agent: longProposal }]);
+check(!lastState.agent_message_replied_to, "an agent proposal without a user reply supplies no approval context");
+
 fs.rmSync(project, { recursive: true });
 console.log(failures ? `\n${failures} FAILED` : "\nall passed");
 process.exit(failures ? 1 : 0);

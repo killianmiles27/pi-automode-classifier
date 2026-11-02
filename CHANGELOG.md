@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.5.1
+
+- Preserve the repair proposal at the end of long messages when a user gives a short approval reply. Keep messages up to 6,000 characters whole; retain the opening and end of longer messages.
+- Redact credentials before trimming approval context. Add regressions for long proposals, bounded context, masking, and proposals without a user reply. Approval thresholds and mandatory checks are unchanged.
+
 ## 0.5.0
 
 - Support native Windows paths and Git Bash drive, temporary, and installation paths with Git for Windows in its standard location.
