@@ -7,9 +7,10 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-// Keeps the handler tests away from the real config file.
+// Keeps the handler tests away from the real config file and the real decisions log.
 process.env.PI_CODING_AGENT_DIR = fs.mkdtempSync(path.join(os.tmpdir(), "pi-automode-classifier-test-"));
-const { bashVerdict, compileRules, fileVerdict, makeScope } = await import("./rules.ts");
+process.env.XDG_STATE_HOME = fs.mkdtempSync(path.join(os.tmpdir(), "pi-automode-classifier-state-"));
+const { bashVerdict, compileRules, fileVerdict, makeScope, powershellVerdict } = await import("./rules.ts");
 
 const home = os.homedir().replace(/\\/g, "/");
 const fixtures = process.env.PI_TEST_FIXTURES ?? os.homedir();
@@ -27,6 +28,7 @@ const check = (want, got, label) => {
 };
 const bash = (want, command, cwd) => check(want, bashVerdict(command, scope(cwd)), command.replace(/\n/g, "\\n"));
 const file = (want, tool, target, cwd) => check(want, fileVerdict(tool, target, scope(cwd)), `${tool} ${target}`);
+const ps = (want, command) => check(want, powershellVerdict(command), `powershell: ${command.replace(/\n/g, "\\n")}`);
 
 // deny
 bash("deny", "rm -rf /");
@@ -87,6 +89,11 @@ bash("ask", "git restore src/main.rs");
 bash("ask", "git branch -D feature");
 bash("ask", "git stash drop");
 bash("ask", "git config --global user.email x@example.com");
+bash("allow", "git config --global user.name");
+bash("allow", "git config --global --list");
+bash("allow", "git config --global --get core.autocrlf");
+bash("ask", "git config --global --add safe.directory /x");
+bash("ask", "git config --system core.longpaths true");
 bash("ask", "git remote set-url origin git@example.com:x/y.git");
 bash("ask", "systemctl --user restart pipewire");
 bash("ask", "pkill -f llama-server");
@@ -1072,10 +1079,10 @@ const llmHandler = (over, replies, top = {}) => {
   fileVerdict("edit", "tracked.sh", edit);
   for (const [p, o] of edit.pending) files.set(p, o);
   const llmRun = bashVerdict("bash tracked.sh", scope(true));
-  check("x", { action: llmRun.action === "classify" && llmRun.files?.length === 1 ? "x" : JSON.stringify(llmRun) }, "rules: with the chat decider an edited project script goes to it when run");
+  check("x", { action: llmRun.action === "classify" && llmRun.runs?.length === 1 ? "x" : JSON.stringify(llmRun) }, "rules: with the chat decider an edited project script goes to it when run");
   check("x", { action: bashVerdict("bash tracked.sh", makeScope(project, [guard], { files: new Map(), project: () => true })).action === "allow" ? "x" : "bad" }, "rules: without it a project script still runs");
   const inline = bashVerdict("cat > gen.sh <<'E'\necho hi\nE\nbash gen.sh", scope(true));
-  check("x", { action: inline.action === "classify" && (inline.files ?? []).length === 0 ? "x" : JSON.stringify(inline) }, "rules: a file written by the same command is judged from the command");
+  check("x", { action: inline.action === "classify" && (inline.runs ?? []).length === 0 ? "x" : JSON.stringify(inline) }, "rules: a file written by the same command is judged from the command");
 }
 {
   // With the chat decider every ask goes to it, except the guard's own files, credential reads,
@@ -1126,6 +1133,39 @@ bash("allow", "curl -fsSLo target/x.tar.gz https://example.com/x.tar.gz");
   pi("allow", bashVerdict("pi install npm:some-extension", makeScope(project, [guard], { rules: compileRules({ allow: ["pi install npm:some-extension"] }) })), "your own allow rule replaces the ask");
   check("x", { action: bashVerdict("pi install npm:some-extension", decider()).pattern === undefined ? "x" : "pattern" }, "pi files: no session pattern for them");
 }
+// The guard's own files: reading them with a command that cannot write no longer asks, and an
+// option word is never a path. Running code, sed -i and writing -exec still ask.
+bash("allow", `cd ${guard} && sed -n '1,20p' index.ts`, guard);
+bash("allow", `cd ${guard} && sed -n '1,20p' index.ts && grep -n askAbove rules.ts`, guard);
+bash("allow", `cd ${guard} && grep -n -e askAbove -e allowBelow rules.ts`, guard);
+bash("ask", `cd ${guard} && python - <<'EOF'\nprint(open('rules.ts').read()[:10])\nEOF`, guard);
+bash("allow", `cd ${guard} && find . -name '*.ts' -exec wc -l {} \\;`, guard);
+bash("allow", `find ~ -name '*.key' -exec ls {} \\;`, guard);
+bash("ask", `cd ${guard} && node rewrite.mjs`, guard);
+bash("ask", `sed -i s/a/b/ ${guard}/rules.ts`, guard);
+// Review regressions: the tuning must not open these.
+bash("ask", `cd ${guard} && python - <<'EOF'\nopen('rules.ts','w').write('')\nEOF`, guard);
+bash("ask", `node -e "require('fs').writeFileSync('${guard}/rules.ts','')"`);
+bash("classify", `find . -name '*.ts' -exec cat {} \\; -exec rm {} \\;`);
+bash("ask", `find ~ -maxdepth 1 -name .bashrc -exec ls {} + -exec rm {} +`);
+bash("ask", `find ~/.ssh -type f -exec cat {} \\;`);
+bash("allow", `find . -name '*.md' -exec wc -l {} \\; -exec ls {} \\;`);
+ps("ask", "Get-ChildItem C:/Users/x/Documents -Recurse | % Delete");
+ps("ask", "Get-ChildItem | ForEach-Object -MemberName Delete");
+ps("ask", "Get-Service Spooler | % Stop");
+ps("ask", "Get-Item x | % { $_.Attributes = 'Hidden' }");
+ps("ask", 'Get-ChildItem -Path "$(Remove-Item -Recurse x)"');
+ps("ask", "Get-Date 2> settings.json");
+ps("ask", "Get-Date *> out.txt");
+ps("ask", "Get-Content ~/.ssh/id_rsa");
+ps("ask", "Get-Content $HOME/.aws/credentials");
+ps("ask", "Get-Clipboard");
+ps("allow", "Get-ChildItem | % FullName");
+ps("allow", "Get-ChildItem | % { $_.Name }");
+ps("allow", "Get-Date 2>$null; Get-Date 2>&1 | Out-String");
+ps("allow", 'Write-Output "total: $($x.Count) size: $($_.Length)"');
+
+bash("ask", `find . -name '*.ts' -exec cp {} /tmp/keys/ \\;`, guard);
 // Shell variables set to a path in the same command.
 bash("allow", "BASE=/tmp/pi-amc; mkdir -p $BASE/state && echo x > $BASE/state/a.txt");
 bash("allow", 'export S="$PWD/target/e2e"; rm -rf "$S"; mkdir -p ${S}/x');
@@ -1199,7 +1239,39 @@ check("x", { action: bashVerdict("llamastash api-key", scope()).critical ? "x" :
 bash("allow", "systemctl --user show-environment");
 bash("ask", "systemctl --user import-environment QT_QPA_PLATFORMTHEME");
 
+// PowerShell: read-only cmdlet work runs, anything that writes, runs code or is unknown asks.
+ps("allow", "Get-Volume | Where-Object DriveLetter | Select-Object DriveLetter,FileSystemLabel,@{n='FreeGB';e={[math]::Round($_.SizeRemaining/1GB,1)}} | Format-Table -AutoSize");
+ps("allow", "Get-Process | Where-Object { $_.ProcessName -match 'plex|sonarr' } | Select-Object ProcessName,Id,Path | Format-Table -AutoSize\nWrite-Output '--- installed ---'");
+ps("allow", "$root='C:\\Media'\n$files = @(Get-ChildItem -LiteralPath $root -Recurse -File -Force)\n$bytes = ($files | Measure-Object Length -Sum).Sum\nWrite-Output ($bytes/1GB)");
+ps("allow", "Write-Output '=== MOVIE FOLDERS ==='\nGet-ChildItem -LiteralPath 'C:\\Media\\Movies' -Directory | ForEach-Object { Write-Output $_.Name }");
+ps("allow", "Get-Content .\\README.md | Select-Object -First 5");
+ps("ask", "Remove-Item C:\\Users\\x -Recurse");
+ps("ask", "Set-Content -Path .\\a.txt -Value hi");
+ps("ask", "Get-ChildItem . | Out-File .\\out.txt");
+ps("ask", "Get-ChildItem . > out.txt");
+ps("ask", "Get-ChildItem . | Tee-Object out.txt");
+ps("ask", "Copy-Item .\\a .\\b");
+ps("ask", "rm .\\build -Recurse");
+ps("ask", "Invoke-Expression $x");
+ps("ask", "Invoke-WebRequest https://example.com -OutFile x.exe");
+ps("ask", "Start-Process notepad");
+ps("ask", "Do-Thing -Name x");
+ps("ask", "git status");
+// .NET and object methods are outside the cmdlet vocabulary: pure static types pass, anything else asks.
+ps("allow", "[math]::Round($x, 2); [string]::Join(',', @(1,2))");
+ps("allow", "Set-StrictMode -Version Latest; Get-Volume");
+ps("ask", "[System.IO.File]::Delete('C:/x')");
+ps("ask", "[IO.File]::WriteAllText('C:/x','y')");
+ps("ask", "(Get-Item C:/x).Delete()");
+ps("ask", "Get-ChildItem | ForEach-Object { $_.Delete() }");
+// A wrapper only runs when -Command carries text the vocabulary can read.
+bash("allow", `powershell.exe -NoProfile -Command "Get-Volume"`);
+bash("ask", `powershell -Command "Remove-Item x"`);
+bash("ask", `powershell.exe -NoProfile -ExecutionPolicy Bypass -File "C:\\tmp\\x.ps1"`);
+bash("ask", `/tmp/pwsh -EncodedCommand ZgBvAG8A`);
+
 fs.rmSync(process.env.PI_CODING_AGENT_DIR, { recursive: true });
 
+fs.rmSync(process.env.XDG_STATE_HOME, { recursive: true, force: true });
 console.log(failures ? `\n${failures} FAILED` : "\nall passed");
 process.exit(failures ? 1 : 0);

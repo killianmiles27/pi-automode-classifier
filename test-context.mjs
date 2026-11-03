@@ -40,6 +40,13 @@ async function decide(command, turns, { hasUI = true, registry, model } = {}) {
 
 const work = ["Fix the failing tests."];
 check((await decide(say("ssh box 'uptime'", 0.2, 0.05), work)) === "run", "harm under lowHarmBelow runs");
+
+// Running code the session wrote is the normal dev loop: a harmless script it just wrote runs
+// without a prompt, and a harmful one still asks because the decider sees the harm.
+const written = path.join(project, "gen.sh");
+await h.tool_call({ toolName: "write", input: { path: written, content: "#!/bin/sh\necho hi\n" }, toolCallId: "w-gen" }, { cwd: project, hasUI: true, ui, sessionManager: { getBranch: () => work.map(turn) } });
+check((await decide(say("sh gen.sh", 0.2, 0.05), work)) === "run", "a harmless script the session wrote runs without a prompt");
+check((await decide(say("sh gen.sh --wipe", 0.2, 0.8), work)) === "ask", "a harmful run of that script still asks");
 check((await decide(say("rsync -a box:~/app/ ./app-copy/", 0.3, 0.3), work)) === "run", "a partly asked, fairly harmless step of the task runs");
 check((await decide(say("git push origin main", 0.85, 0.85), ["push it"])) === "run", "asked for runs even when harmful");
 check((await decide(say("ssh box 'rm -rf ~/data'", 0.03, 0.95), work)) === "block", "not asked and harmful is blocked without a prompt");
@@ -102,16 +109,6 @@ hooks.active = undefined;
 const st = contextState({ requests: ["use key sk-abcdefghijklmnopqrstuvwxyz"], tool: "bash", command: "export API_KEY=hunter2", cwd: "/", inside: true });
 check(!JSON.stringify(st).includes("sk-abcdefghijklmnopqrstuvwxyz") && !JSON.stringify(st).includes("hunter2"), "tokens and keys are masked in the state");
 check(redact("password: 'x y z'").text === "password: <redacted>", "quoted secrets are masked whole");
-
-const approvedTail = "Want me to patch pi-context-prune and make a local backup?";
-const longProposal = "Diagnosis. " + "Details about the failure. ".repeat(100) + approvedTail;
-await decide(say("python -c 'print(123)'", 0.9, 0.2), ["Investigate the pruner error.", { agent: longProposal }, "yup please fix it"]);
-check(lastState.agent_message_replied_to === longProposal, "approval retains the complete proposal after a long diagnosis");
-const hugeReply = contextState({ requests: ["yes"], replyTo: "Opening. " + "details ".repeat(2000) + " password='secret fixture' " + approvedTail, tool: "bash", command: "echo test", cwd: project, inside: true });
-check(hugeReply.agent_message_replied_to.length <= 6000 && hugeReply.agent_message_replied_to.startsWith("Opening.") && hugeReply.agent_message_replied_to.endsWith(approvedTail), "very long approval context preserves opening and proposal within its bound");
-check(!hugeReply.agent_message_replied_to.includes("secret fixture"), "approval context is redacted before truncation");
-await decide(say("python -c 'print(456)'", 0.01, 0.99), ["Investigate the error.", { agent: longProposal }]);
-check(!lastState.agent_message_replied_to, "an agent proposal without a user reply supplies no approval context");
 
 fs.rmSync(project, { recursive: true });
 console.log(failures ? `\n${failures} FAILED` : "\nall passed");

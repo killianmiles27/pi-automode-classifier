@@ -37,7 +37,7 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { bashVerdict, commitWrites, compileRules, setSecretPaths, fileVerdict, isRootLike, makeScope, readVerdict, within, type Action, type SessionFiles, type Verdict } from "./rules.ts";
+import { bashVerdict, commitWrites, compileRules, setSecretPaths, fileVerdict, isRootLike, makeScope, powershellVerdict, readVerdict, within, type Action, type SessionFiles, type Verdict } from "./rules.ts";
 import { contextState, CTX_QUESTIONS, redact, SHORT_REPLY } from "./context.ts";
 import { buildSystemPrompt, buildTranscript, denyMessage, mergeRules, parseVerdict, STAGE1_INSTRUCTION, stage2Instruction, DEFAULT_RULES, DEFAULT_LLM, type LlmConfig, type Outcome, type TranscriptItem } from "./automode.ts";
 
@@ -824,8 +824,7 @@ function git(dir: string, ...args: string[]): string | undefined {
 }
 const realpath = (p: string) => {
   try {
-    const resolved = fs.realpathSync.native(p);
-    return process.platform === "win32" ? resolved.replace(/\\/g, "/") : resolved;
+    return fs.realpathSync.native(p).replace(/\\/g, "/");
   } catch {
     return p;
   }
@@ -1123,9 +1122,7 @@ export default function (pi: ExtensionAPI, overrides: Partial<Config> = {}) {
     let verdict: Verdict;
     if (typeof input.command === "string") {
       subject = input.command;
-      verdict = event.toolName === "powershell"
-        ? { action: "ask", reason: "PowerShell requires review; automatic rules parse Bash", firm: true, critical: true }
-        : bashVerdict(subject, scope);
+      verdict = event.toolName === "powershell" ? powershellVerdict(subject, scope) : bashVerdict(subject, scope);
     } else if ((event.toolName === "write" || event.toolName === "edit") && typeof input.path === "string") {
       subject = input.path;
       verdict = fileVerdict(event.toolName, subject, scope);
@@ -1179,7 +1176,7 @@ export default function (pi: ExtensionAPI, overrides: Partial<Config> = {}) {
       const steps: Record<string, unknown>[] = [];
       entry.steps = steps;
       let lancet: number | undefined;
-      if (!kind && !verdict.ruleAsk && !verdict.files && config.decider.includes("command")) {
+      if (!kind && !verdict.ruleAsk && !verdict.files && !verdict.runs && config.decider.includes("command")) {
         const result = await classify(config, { tool: event.toolName, cwd: ctx.cwd, command: subject }, ctx.signal, ctx.modelRegistry as unknown as Registry, "command");
         steps.push({ decider: "command", model: classifierName(config, "command"), ...result });
         if ("answers" in result) lancet = result.answers.risky;
@@ -1232,7 +1229,7 @@ export default function (pi: ExtensionAPI, overrides: Partial<Config> = {}) {
 
     let toLlm = false;
     if (verdict.action === "classify") {
-      const chain = verdict.ruleAsk || verdict.files ? config.decider.filter((d) => d === "llm") : config.decider;
+      const chain = verdict.ruleAsk || verdict.files || verdict.runs ? config.decider.filter((d) => d === "llm") : config.decider;
       const steps: Record<string, unknown>[] = [];
       for (const [i, stage] of chain.entries()) {
         if (stage === "llm") {
@@ -1263,7 +1260,8 @@ export default function (pi: ExtensionAPI, overrides: Partial<Config> = {}) {
     if (toLlm) {
       const llm = config.llm;
       const branch = (ctx.sessionManager?.getBranch?.() ?? []) as { message?: Record<string, unknown> }[];
-      const actionFiles = verdict.files?.length ? fileContents(verdict.files) : undefined;
+      const shown = [...(verdict.files ?? []), ...(verdict.runs ?? [])];
+      const actionFiles = shown.length ? fileContents(shown) : undefined;
       const items = transcriptItems(branch, llm, { tool: event.toolName, input, id: event.toolCallId, files: actionFiles }, decided);
       const decision = await decideWithLlm(config, items, ctx.signal, ctx.modelRegistry as unknown as ChatRegistry, ctx.model as unknown as Record<string, unknown>);
       Object.assign(entry, { model: llmName(llm, ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined), llm: { stage: "stage" in decision ? decision.stage : undefined, tokens: "tokens" in decision ? decision.tokens : undefined } });
