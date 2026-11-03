@@ -1,15 +1,16 @@
 // Commands are inert strings. These tests never execute destructive operations.
 import assert from "node:assert/strict";
+import fs from "node:fs";
 import path from "node:path";
 import os from "node:os";
-import fs from "node:fs";
+import { bashVerdict, fileVerdict, makeScope, readVerdict } from "./rules.ts";
+// Keep the run out of the user's real decisions log; the guard reads this when it loads.
+process.env.XDG_STATE_HOME = fs.mkdtempSync(path.join(os.tmpdir(), "pi-automode-classifier-state-"));
+// Outside Pi there is no agent directory; any scratch one exercises the same paths.
+process.env.PI_CODING_AGENT_DIR ??= fs.mkdtempSync(path.join(os.tmpdir(), "pi-automode-classifier-agent-"));
+const { default: extension, loadConfig } = await import("./index.ts");
 
 assert.equal(process.platform, "win32", "Run this regression suite on Windows");
-const agentDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-windows-guard-test-"));
-process.env.PI_CODING_AGENT_DIR = agentDir;
-const { bashVerdict, fileVerdict, makeScope, readVerdict } = await import("./rules.ts");
-const { default: extension } = await import("./index.ts");
-process.on("exit", () => fs.rmSync(agentDir, { recursive: true, force: true }));
 const project = path.join(os.homedir(), "Documents", "pi-windows-test-project");
 const scope = () => makeScope(project, [import.meta.dirname]);
 let checks = 0;
@@ -42,5 +43,6 @@ let statusCommand;
 let status;
 extension({ on() {}, registerCommand(_name, command) { statusCommand = command; } }, { log: false, decider: ["context"] });
 await statusCommand.handler("status", { ...ctx, ui: { notify(message) { status = message; } } });
-check(status.includes("context decider openrouter/typesafe/jev-1.14") && !status.includes("model server"), true, "status describes the context provider accurately");
+const loaded = loadConfig().config;
+check(status.includes(`context decider ${loaded.context.provider}/${loaded.context.model}`) && !status.includes("model server"), true, "status describes the context provider accurately");
 console.log(`${checks} Windows regression checks passed`);

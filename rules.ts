@@ -48,7 +48,9 @@ export interface Verdict {
   // model: only the chat model sees whether the user asked for it.
   ruleAsk?: boolean;
   // Set on a classify verdict that runs files the session wrote: their paths, so the decider can
-  // be given what runs.
+  // be given what runs. These are not write targets: the call does not change them.
+  runs?: string[];
+  // Files the call writes, whose content the decider is given.
   files?: string[];
 }
 
@@ -68,9 +70,15 @@ const RANK: Record<Action, number> = { allow: 0, classify: 1, ask: 2, deny: 3 };
 function worst(...verdicts: Verdict[]): Verdict {
   const hold = (v: Verdict) => (v.locked ? 3 : v.critical ? 2 : v.firm ? 1 : 0);
   const w = verdicts.reduce((a, b) => (RANK[b.action] > RANK[a.action] || (RANK[b.action] === RANK[a.action] && hold(b) > hold(a)) ? b : a));
-  // Files that run go to the decider whichever part of the command runs them.
+  // Files that run and files that are written go to the decider whichever part of the command
+  // reaches them. `runs` is not a write target, so it does not hold back the fast paths.
   const files = verdicts.flatMap((v) => v.files ?? []);
-  return files.length && w.action === "classify" ? { ...w, files: [...new Set(files)] } : w;
+  const runs = verdicts.flatMap((v) => v.runs ?? []);
+  if (w.action !== "classify") return w;
+  const merged = { ...w };
+  if (files.length) merged.files = [...new Set(files)];
+  if (runs.length) merged.runs = [...new Set(runs)];
+  return merged;
 }
 const ALLOW: Verdict = { action: "allow", reason: "" };
 const classify = (reason: string): Verdict => ({ action: "classify", reason });
@@ -312,7 +320,7 @@ function runFile(word: string, args: string[], scope: Scope): Verdict | undefine
   if (origin === "authored") {
     if (!scope.chatDecider) return ALLOW;
     // A file written by this same command is in the command itself.
-    return { ...classify(`runs ${word}, which this session wrote`), files: scope.pending.has(p) ? [] : [p] };
+    return { ...classify(`runs ${word}, which this session wrote`), runs: scope.pending.has(p) ? [] : [p] };
   }
   return origin === undefined && scope.project?.(p) ? ALLOW : undefined;
 }
@@ -346,8 +354,9 @@ export function setSecretPaths(paths: string[]) {
 }
 
 function isSecretPath(p: string): boolean {
-  if (process.platform === "win32") p = slash(p).toLowerCase();
-  if (extraSecrets.some((s) => { if (process.platform === "win32") s = slash(s).toLowerCase(); return p === s || p.startsWith(s + "/"); })) return true;
+  p = slash(p);
+  if (process.platform === "win32") p = p.toLowerCase();
+  if (extraSecrets.some((s) => { s = slash(s); if (process.platform === "win32") s = s.toLowerCase(); return p === s || p.startsWith(s + "/"); })) return true;
   const name = path.basename(p);
   // Public keys, host lists, client settings, env templates and certificates hold nothing secret.
   if (/\.pub$|^known_hosts|^authorized_keys$|^\.env\.(example|sample|template|dist|defaults?)$/i.test(name)) return false;
@@ -377,11 +386,39 @@ const NAMES_ONLY = new Set(
 // The first operand of these is a pattern, filter or script, not a file.
 const PATTERN_FIRST = new Set(["grep", "egrep", "fgrep", "rg", "ag", "ack", "sed", "awk", "gawk", "jq", "yq"]);
 
+// sed with an in-place flag rewrites its files; without one it only prints.
+const sedWrites = (args: string[]) => args.some((a) => /^(-i|--in-place)/.test(a) || /^-[a-zA-Z]*i/.test(a));
+// find options that delete files, run a command or write a file.
+const FIND_ACTS = /^-(delete|exec|execdir|ok|okdir|fprint|fprintf|fls)$/;
+// A command that cannot change a file: the read-only tools, `cd`, sed without -i, find without
+// an action, and an interpreter or shell given no code and no file to run.
+const readsOnlyCommand = (name: string, args: string[], scope?: Scope) =>
+  READ_ONLY.has(name) || ["cd", "pushd", "popd"].includes(name)
+    || (name === "sed" && !sedWrites(args))
+    || (name === "find" && findReads(args, scope));
+// find that only lists: no action at all, or an -exec whose own command only reads. The {} and
+// glob words after -exec are not paths the guard check should resolve against the cwd.
+function findReads(args: string[], scope?: Scope): boolean {
+  const acts = args.filter((a) => FIND_ACTS.test(a));
+  if (!acts.length) return true;
+  if (acts.some((a) => a !== "-exec" && a !== "-execdir" && a !== "-ok" && a !== "-okdir")) return false;
+  for (let exec = 0; exec < args.length; exec++) {
+    if (!/^-(exec|execdir|ok|okdir)$/.test(args[exec])) continue;
+    const end = args.findIndex((a, i) => i > exec && (a === ";" || a === "+"));
+    const inner = unwrap(args.slice(exec + 1, end < 0 ? undefined : end).map((a) => (a === "{}" ? "." : a)));
+    if (!inner.length || !readsOnlyCommand(path.basename(inner[0]), inner.slice(1), scope)) return false;
+    if (scope && simple({ argv: inner, out: [] }, scope, 1).action !== "allow") return false;
+    if (end < 0) break;
+    exec = end;
+  }
+  return true;
+}
+
 // The credential file a simple command would read, if any.
 function credentialRead(name: string, args: string[], cmd: Simple, scope: Scope): string | undefined {
   if (NAMES_ONLY.has(name)) return undefined;
   // An in-place edit shows nothing, and a destination is written, not read.
-  if (name === "sed" && args.some((a) => /^(-i|--in-place)/.test(a) || /^-[a-zA-Z]*i/.test(a))) return undefined;
+  if (name === "sed" && sedWrites(args)) return undefined;
   let words = args;
   if (PATTERN_FIRST.has(name)) words = operands(args).slice(1);
   else if (COPIERS.has(name)) words = operands(args).slice(0, -1);
@@ -808,7 +845,12 @@ function git(args: string[], scope: Scope): Verdict {
   if (sub === "tag") return has("-d", "--delete") ? ask("git tag -d deletes a tag") : ALLOW;
   if (sub === "reset" || sub === "clean" || sub === "checkout" || sub === "restore") return ALLOW;
   if (sub === "config") {
-    if (has("--global", "--system")) return has("--get", "--get-all", "--list", "-l") ? ALLOW : ask("changes git config outside the repository");
+    if (has("--global", "--system")) {
+      // Reading a key (`git config --global user.name`) changes nothing; setting one names a value.
+      const setting = has("--unset", "--unset-all", "--add", "--replace-all", "--rename-section", "--remove-section", "--edit", "-e")
+        || rest.filter((a) => !a.startsWith("-")).length >= 2;
+      return setting ? ask("changes git config outside the repository") : ALLOW;
+    }
     return ALLOW;
   }
   if (sub === "remote") return has("add", "set-url", "remove", "rm", "rename") ? ask("changes where git pushes and fetches") : ALLOW;
@@ -944,19 +986,30 @@ function optionValues(args: string[], valued: string, long: string[]): [string, 
 function find(args: string[], scope: Scope): Verdict {
   const firstOption = args.findIndex((a) => /^(-|\(|!)/.test(a));
   const roots = firstOption < 0 ? args : args.slice(0, firstOption);
-  const acts = args.some((a) => /^-(delete|exec|execdir|ok|okdir|fprint|fprintf|fls)$/.test(a));
-  if (!acts) return ALLOW;
+  if (!args.some((a) => FIND_ACTS.test(a))) return ALLOW;
+  const exec = args.findIndex((a) => /^-(exec|execdir|ok|okdir)$/.test(a));
+  // -exec settles on its own command: one that only reads (ls, cat, wc, diff) writes nothing,
+  // so it runs even when the search crosses Pi's own files or leaves the working directory.
+  let inner: string[] | undefined;
+  if (exec >= 0) {
+    const end = args.findIndex((a, i) => i > exec && (a === ";" || a === "+"));
+    // {} stands for a path under the search roots.
+    inner = args.slice(exec + 1, end < 0 ? undefined : end).map((a) => (a === "{}" ? "." : a));
+    const rootPaths = (roots.length ? roots : ["."]).map((r) => ({ r, p: resolveWord(r, scope) }));
+    const secret = rootPaths.find(({ r, p }) => secretIn(r, scope) || (p && isSecretPath(p)));
+    if (secret) return criticalAsk(`find reads a credential location: ${secret.r}`);
+    // Outside the project only commands that show names, not contents (ls, stat, du), skip the check.
+    const execNames = args.flatMap((a, i) => (/^-(exec|execdir|ok|okdir)$/.test(a) && args[i + 1] ? [path.basename(args[i + 1])] : []));
+    const namesOnly = execNames.every((n) => NAMES_ONLY.has(n));
+    if (findReads(args, scope) && rootPaths.every(({ p }) => !isPiFile(p, scope) && (namesOnly || isLocal(p, scope)))) return ALLOW;
+  }
   for (const r of roots.length ? roots : ["."]) {
     const p = resolveWord(r, scope);
     if (isPiFile(p, scope)) return piAsk(`find deletes or runs commands in Pi's own files: ${r}`);
     if (!isLocal(p, scope)) return outside(`find deletes or runs commands outside the working directory: ${r}`, p);
   }
-  const exec = args.findIndex((a) => /^-(exec|execdir|ok|okdir)$/.test(a));
   if (exec < 0) return classify("find -delete");
-  const end = args.findIndex((a, i) => i > exec && (a === ";" || a === "+"));
-  // {} stands for a path under the search roots, which were checked above.
-  const inner = args.slice(exec + 1, end < 0 ? undefined : end).map((a) => (a === "{}" ? "." : a));
-  return worst(classify("find -exec"), simple({ argv: inner, out: [] }, scope, 1));
+  return worst(classify("find -exec"), simple({ argv: inner!, out: [] }, scope, 1));
 }
 
 // Drops leading keywords, VAR=value assignments and wrappers such as `timeout 60` or `env`.
@@ -1039,13 +1092,23 @@ function command(cmd: Simple, scope: Scope, depth: number): Verdict {
   const args = argv.slice(1);
 
   // Bash's parser cannot determine the semantics of another shell's inline code.
-  if (/^(powershell|pwsh|cmd)(\.exe)?$/i.test(name)) return criticalAsk("runs Windows shell code; review the full command");
+  if (/^(powershell|pwsh)(\.exe)?$/i.test(name)) {
+    // -Command carries the text, so the vocabulary can read it; -File and -EncodedCommand hide it.
+    const at = args.findIndex((a) => /^-(command|c)$/i.test(a));
+    if (at >= 0 && args[at + 1]) return powershellVerdict(args.slice(at + 1).join(" "), scope);
+    return criticalAsk("PowerShell needs review; the command is hidden from the rules");
+  }
+  if (/^cmd(\.exe)?$/i.test(name)) return criticalAsk("cmd.exe needs review; the rules cannot see what it runs");
 
   if (["case", "function", "select", "source", ".", "trap", "alias"].includes(name)) return worst(verdict, classify(`shell ${name}`));
   if (/^mkfs(\.|$)/.test(name) || name === "wipefs") return deny(`${name} formats a disk`);
 
-  // The guard's own files: only read-only commands may name them.
-  if (!READ_ONLY.has(name) && args.some((a) => isGuarded(resolveWord(a.replace(/^[^=]*=/, ""), scope), scope))) {
+  // The guard's own files: only commands that can write them ask.
+  // `cd` moves the shell, not a file; sed without -i and find without an action only read; and
+  // an option word (`-n`, `--depth`, a bare `-` for stdin) is never a path, though an attached
+  // value such as --output=/path still is.
+  const named = args.filter((a) => !a.startsWith("-") || a.includes("="));
+  if (!readsOnlyCommand(name, args, scope) && ((scope.cwd !== undefined && isGuarded(scope.cwd, scope)) || named.some((a) => isGuarded(resolveWord(a.replace(/^[^=]*=/, ""), scope), scope)))) {
     verdict = worst(verdict, guardAsk(`${name} touches the auto-mode guard's own files`));
   }
   const secret = credentialRead(name, args, cmd, scope);
@@ -1101,7 +1164,7 @@ function command(cmd: Simple, scope: Scope, depth: number): Verdict {
       if (p && isRootLike(p)) return deny(`${name} -R on ${t} would change a home or system directory`);
     }
   }
-  if (name === "sed") return worst(verdict, args.some((a) => /^(-i|--in-place)/.test(a) || /^-[a-zA-Z]*i/.test(a)) ? writeTargets("sed", args, scope) : ALLOW);
+  if (name === "sed") return worst(verdict, sedWrites(args) ? writeTargets("sed", args, scope) : ALLOW);
   if (name === "awk" || name === "gawk") return worst(verdict, args.some((a) => /system\s*\(|\|\s*"|>\s*"/.test(a)) ? classify("awk that runs commands or writes files") : ALLOW);
   if (WRITERS[name]) return worst(verdict, writeTargets(name, args, scope, !!cmd.heredoc && !cmd.expands));
   if (name === "tar" || name === "zip" || name === "unzip" || name === "gzip" || name === "gunzip" || name === "xz" || name === "zstd") {
@@ -1220,11 +1283,131 @@ function evaluateParsed(parsed: Parsed, scope: Scope, depth: number): Verdict {
   return verdict.pattern && patterns.size > 1 ? { ...verdict, pattern: undefined } : verdict;
 }
 
+// A guarded path written anywhere in the command text, in either slash style, any case.
+function mentionsGuarded(text: string, scope: Scope): string | undefined {
+  const norm = (p: string) => p.replace(/\\+/g, "/").replace(/^\/([a-z])\//i, "$1:/").toLowerCase();
+  const hay = norm(text);
+  return scope.guarded.map(norm).find((g) => g.length > 3 && hay.includes(g));
+}
+
 export function bashVerdict(command: string, scope: Scope): Verdict {
   if (FORK_BOMB.test(command)) return deny("fork bomb");
   const verdict = evaluateParsed(parse(command), scope, 0);
   if (verdict.action === "deny") return verdict;
-  return forDecider(PIPE_TO_SHELL.test(command) ? worst(verdict, criticalAsk("downloads code and runs it")) : verdict, scope);
+  const named = verdict.action === "classify" && mentionsGuarded(command, scope);
+  const guarded = named ? worst(verdict, guardAsk(`code that names the auto-mode guard's own files: ${named}`)) : verdict;
+  return forDecider(PIPE_TO_SHELL.test(command) ? worst(guarded, criticalAsk("downloads code and runs it")) : guarded, scope);
+}
+
+// PowerShell: the Bash parser does not read the language, so a small vocabulary stands in for it.
+// A line runs when every command position is a read-only cmdlet and no writer or executor appears
+// anywhere; anything the vocabulary does not know asks. `Get-Volume | Select-Object` runs,
+// `Set-Content`, `Remove-Item`, `Out-File`, `Invoke-*`, redirection and encoded commands ask.
+const PS_READERS = new Set([
+  "test-path", "resolve-path", "split-path", "join-path", "convert-path", "measure-object",
+  "compare-object", "join-string", "group-object", "sort-object", "select-object", "select-string",
+  "select-xml", "where-object", "foreach-object", "measure-command",
+  "out-string", "out-host", "out-null",
+  "write-output", "write-host", "write-verbose", "write-debug", "write-information", "write-warning", "write-error",
+  "convertto-json", "convertto-csv", "convertto-xml", "convertto-html", "convertfrom-json", "convertfrom-csv", "convertfrom-stringdata",
+  "foreach", "for", "while", "if", "else", "elseif", "try", "catch", "finally", "switch", "return",
+  "set-strictmode", "set-location", "set-psdebug",
+]);
+const PS_READER_PREFIXES = ["get-", "format-"];
+// ForEach-Object member names that only read a property.
+const PS_SAFE_MEMBERS = new Set([
+  "name", "fullname", "basename", "extension", "length", "count", "id", "processname", "path", "directory",
+  "directoryname", "lastwritetime", "creationtime", "mode", "status", "displayname", "value", "key", "keys",
+  "values", "version", "source", "definition", "line", "linenumber", "matches", "tostring", "trim", "toupper", "tolower",
+]);
+// .NET types whose static members only compute: [math]::Round, [string]::Join, [convert]::ToInt32.
+// Any other [type]::member can touch files, the registry or the network, so it asks.
+const PS_PURE_TYPES = new Set([
+  "math", "string", "convert", "int", "int16", "int32", "int64", "uint32", "uint64", "long", "double", "single",
+  "decimal", "datetime", "datetimeoffset", "timespan", "guid", "char", "bool", "boolean", "byte", "version", "regex",
+]);
+// .NET and object methods that change something: $file.Delete(), (Get-Item x).MoveTo(y).
+const PS_DESTRUCTIVE_METHODS = /\.\s*(delete|deletedirectory|move|moveto|copy|copyto|writeall\w+|appendall\w+|create|createdirectory|openwrite|setattributes|remove|unlink|rename|truncate|kill|terminate|stop|start|restart|pause|invoke|put|setvalue|deletevalue|deletesubkey\w*|uninstall|install|encrypt|decrypt)\s*\(/i;
+// Cmdlets that change something, whatever their noun.
+const PS_WRITERS = /(?:^|[\s|;(){}\[\]])(set|new|remove|clear|add|move|copy|rename|out-file|tee|export|import|start|stop|restart|suspend|resume|enable|disable|register|unregister|install|uninstall|update|publish|save|backup|restore|grant|revoke|initialize|resize|invoke|format-volume|mount|dismount|write-eventlog|exit)-[\w]+/i;
+// Aliases, as canonical cmdlets. Writers are caught by PS_WRITERS after the mapping.
+const PS_ALIASES: Record<string, string> = {
+  ls: "get-childitem", dir: "get-childitem", gci: "get-childitem", gi: "get-item", cat: "get-content",
+  gc: "get-content", type: "get-content", ps: "get-process", gps: "get-process", gv: "get-variable",
+  gsv: "get-service", gcm: "get-command", gm: "get-member", gl: "get-location", pwd: "get-location",
+  gdr: "get-psdrive", ghy: "get-history", gsn: "get-pssession",
+  echo: "write-output", write: "write-output", where: "where-object", "?": "where-object", "%": "foreach-object",
+  group: "group-object", sort: "sort-object", select: "select-object", compare: "compare-object",
+  ft: "format-table", fl: "format-list", fw: "format-wide",
+  rm: "remove-item", del: "remove-item", erase: "remove-item", rd: "remove-item", rmdir: "remove-item",
+  si: "set-item", sc: "set-content", ac: "add-content", ni: "new-item",
+  cp: "copy-item", copy: "copy-item", cpi: "copy-item", mv: "move-item", move: "move-item", mi: "move-item",
+  rni: "rename-item", ren: "rename-item", sal: "set-alias", nal: "new-alias", rv: "remove-variable",
+  iex: "invoke-expression", icm: "invoke-command", iwr: "invoke-webrequest", irm: "invoke-restmethod",
+  kill: "stop-process", spps: "stop-process", saps: "start-process", start: "start-process",
+};
+
+/** Every command position is a reader and no writer or executor appears: no prompt. */
+export function powershellVerdict(command: string, _scope?: Scope): Verdict {
+  const text = command.replace(/\r/g, "");
+  // Text inside quotes cannot run, so only the bare text decides what runs.
+  // "…$(cmd)…" runs cmd: judge each subexpression with the same vocabulary.
+  for (const str of text.replace(/'[^']*'/g, "''").match(/"[^"]*"/g) ?? []) {
+    for (let at = str.indexOf("$("); at >= 0; at = str.indexOf("$(", at + 2)) {
+      let depth = 0, end = at + 1;
+      for (; end < str.length; end++) { if (str[end] === "(") depth++; else if (str[end] === ")" && --depth === 0) break; }
+      const body = str.slice(at + 2, end).trim();
+      // A variable or property read: "$($x.Count)", "$($_.Length)".
+      if (/^\$[\w:]+(\.\w+)*$/.test(body)) continue;
+      const inner = powershellVerdict(body, _scope);
+      if (inner.action !== "allow") return criticalAsk(`PowerShell runs a subexpression inside a string: ${inner.reason}`);
+    }
+  }
+  const bare = text.replace(/'[^']*'/g, "''").replace(/"[^"]*"/g, '""');
+  if (/\b(iex|invoke-expression|invoke-command|icm)\b/i.test(bare) || /-e(nc|ncodedcommand)?\b/i.test(bare)) return criticalAsk("PowerShell evaluates or runs an encoded command");
+  // A method call or a static .NET call is outside the cmdlet vocabulary; only pure types pass.
+  if (PS_DESTRUCTIVE_METHODS.test(bare)) return criticalAsk("PowerShell calls a method that changes files");
+  if (/[)\]]\s*\.\s*\w+\s*\(/.test(bare)) return criticalAsk("PowerShell calls a method on an expression");
+  for (const call of bare.matchAll(/\[([\w.]+)\]\s*::/g)) {
+    if (!PS_PURE_TYPES.has(call[1].toLowerCase().replace(/^system\./, ""))) return criticalAsk(`PowerShell calls ${call[1]}`);
+  }
+  if (/(^|[^>])(\d|\*)?>>?\s*(?!\$null\b)[^&\s]/i.test(bare) || /\b(out-file|tee-object)\b/i.test(bare)) return criticalAsk("PowerShell writes a file");
+  // ForEach-Object given a member name calls it: `gci | % Delete`, `gsv x | % Stop`. Only plain
+  // property reads pass.
+  for (const m of bare.matchAll(/(?:^|[|;\s(])(?:%|foreach-object|foreach)\s+(?:-membername\s+)?([A-Za-z_]\w*)/gi)) {
+    if (!PS_SAFE_MEMBERS.has(m[1].toLowerCase())) return criticalAsk(`PowerShell calls the member ${m[1]} on each object`);
+  }
+  // Setting a property changes the object: `$_.Attributes = 'Hidden'`, `$f.IsReadOnly = $true`.
+  if (/\$[\w:]+(\.\w+)+\s*[+\-*/]?=(?!=)/.test(bare)) return criticalAsk("PowerShell sets a property");
+  // Credentials: the same files a Bash read would ask for, plus the secret and clipboard stores.
+  if (/\b(get-credential|get-secret|get-storedcredential|get-clipboard)\b/i.test(bare)) return criticalAsk("PowerShell reads a credential store");
+  for (const word of text.split(/[\s|;(){}]+/)) {
+    const w = word.replace(/^['"]|['"]$/g, "").replace(/^(-[\w]+:)/, "").replace(/^\$(env:userprofile|home)\b/i, "~").replace(/\\/g, "/");
+    if (_scope && w && !w.startsWith("-") && secretIn(w, _scope)) return criticalAsk(`PowerShell reads a credential file: ${w}`);
+    if (!_scope && w && isSecretPath(expandHome(w))) return criticalAsk(`PowerShell reads a credential file: ${w}`);
+  }
+  // Set-StrictMode and Set-Location only change the shell itself, like cd.
+  const bareWriters = bare.replace(/\bset-(strictmode|location|psdebug)\b/gi, "safe");
+  const writer = PS_WRITERS.exec(bareWriters);
+  if (writer) return criticalAsk(`PowerShell runs ${writer[0].trim()}`);
+  // A writer written as an alias (rm, sc, si, ni, cp, mv…) is a writer too.
+  for (const word of bare.split(/[\s|;(){}[\]]+/)) {
+    const canonical = PS_ALIASES[word.toLowerCase()];
+    if (canonical && !PS_READERS.has(canonical) && !PS_READER_PREFIXES.some((p) => canonical.startsWith(p))) {
+      return criticalAsk(`PowerShell runs ${word} (${canonical})`);
+    }
+  }
+  for (const piece of bare.split(/\n|;|\|/)) {
+    // Strip an assignment, then skip the pieces that are not a command: a hashtable entry, a
+    // subexpression, a continuation of a block, a comment or a bare string.
+    const line = piece.trim().replace(/^\$[\w:]+(\[[^\]]*\])?\s*=\s*/, "");
+    if (!line || /^[@({[}\])#'"-]/.test(line) || /^[\w.'"]+=/.test(line)) continue;
+    const word = line.split(/\s+/)[0].replace(/^microsoft\.[\w.]*\\/i, "").toLowerCase();
+    const canonical = PS_ALIASES[word] ?? word;
+    if (PS_READERS.has(canonical) || PS_READER_PREFIXES.some((p) => canonical.startsWith(p))) continue;
+    return ask(`PowerShell ${word} needs review`);
+  }
+  return ALLOW;
 }
 
 // write and edit tools.
