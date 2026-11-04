@@ -33,6 +33,7 @@
     "lancet",
     "README.md",
     "CHANGELOG.md",
+    "docs",
     "LICENSE"
   ],
   "scripts": {

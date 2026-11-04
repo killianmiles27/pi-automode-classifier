@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Add `docs/TUNING.md`: the read-only rule changes, the PowerShell vocabulary, and the opt-in thresholds that cut prompts, with the measured effect and the review fixes that closed the bypasses.
+
 Fewer prompts for read-only work:
 
 - `cd`/`pushd`/`popd`, option words (`-n`, `--depth`, a bare `-`), `sed` without `-i` and `find` whose every `-exec` only reads no longer count as touching the guard's own files.

@@ -803,6 +803,8 @@ Optional, in `~/.pi/agent/extensions/pi-automode-classifier/config.json`. A conf
 
 The decision log holds full commands, so treat it like shell history.
 
+For tuning that trades fewer prompts for the same hard limits, see [docs/TUNING.md](docs/TUNING.md).
+
 ### Your own rules
 
 Here is a config that allows pushes to `origin`, lets the decider judge deploys, always asks for `terraform apply` and blocks force pushes:
