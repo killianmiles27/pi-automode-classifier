@@ -652,7 +652,8 @@ locked(`ln -s '${path.join(os.homedir(), ".p{i}")}' link`, "ln to brace-hidden .
 bash("allow", `ln -s '${path.join(project, "docs")}' link`, "ln within the project");
 bash("allow", `ln '${path.join(project, "rules.ts")}' '${path.join(project, "rules-link.ts")}'`, "hard link within the project");
 
-critical(`cmd /c mklink /D link '${path.join(os.homedir(), ".ssh")}'`, "mklink to .ssh");
+// mklink only exists on Windows, and a POSIX path reads as one of its flags.
+if (windows) critical(`cmd /c mklink /D link '${path.join(os.homedir(), ".ssh")}'`, "mklink to .ssh");
 locked(`cmd /c mklink /J link '${guard}'`, "mklink to the guard");
 bash("classify", "cmd /c mklink link docs\\a.txt", "mklink within the project is still cmd");
 
