@@ -25,9 +25,14 @@ import os from "node:os";
 import path from "node:path";
 
 export type Action = "allow" | "classify" | "ask" | "deny";
+// The floor class of a verdict (docs/SPEC-auto-modes.md section 6). The decision core uses it
+// when a model may only make a call stricter; `worst` keeps the class of the winning verdict.
+export type VerdictClass = "hard" | "locked" | "exfil" | "critical" | "firm" | "outward" | "opaque";
 export interface Verdict {
   action: Action;
   reason: string;
+  // Which floor this verdict belongs to. An allow has none.
+  class?: VerdictClass;
   // A user allow rule cannot replace this verdict.
   locked?: boolean;
   // An ask that stays an ask with the chat decider: your own ask rules and the critical asks.
@@ -81,11 +86,13 @@ function worst(...verdicts: Verdict[]): Verdict {
   return merged;
 }
 const ALLOW: Verdict = { action: "allow", reason: "" };
-const classify = (reason: string): Verdict => ({ action: "classify", reason });
-const ask = (reason: string): Verdict => ({ action: "ask", reason });
-const deny = (reason: string): Verdict => ({ action: "deny", reason });
-const guardAsk = (reason: string): Verdict => ({ action: "ask", reason, locked: true });
-const criticalAsk = (reason: string): Verdict => ({ action: "ask", reason, firm: true, critical: true });
+const classify = (reason: string): Verdict => ({ action: "classify", reason, class: "opaque" });
+const ask = (reason: string): Verdict => ({ action: "ask", reason, class: "outward" });
+const deny = (reason: string): Verdict => ({ action: "deny", reason, class: "hard" });
+const guardAsk = (reason: string): Verdict => ({ action: "ask", reason, class: "locked", locked: true });
+const criticalAsk = (reason: string): Verdict => ({ action: "ask", reason, class: "critical", firm: true, critical: true });
+// A classify for something that reaches outside the working directory (git hooks, persistence).
+const outwardClassify = (reason: string): Verdict => ({ action: "classify", reason, class: "outward" });
 // With the chat decider, Claude Code's split: the rules allow what is plainly routine and block
 // what is plainly destructive, and the decider judges the rest instead of you being asked.
 const forDecider = (v: Verdict, scope: Scope): Verdict => (scope.chatDecider && v.action === "ask" && !v.locked && !v.firm ? { ...v, action: "classify", ruleAsk: true } : v);
@@ -95,6 +102,8 @@ const forDecider = (v: Verdict, scope: Scope): Verdict => (scope.chatDecider && 
 // realpath that also works for a path that does not exist: resolves the deepest existing
 // ancestor and keeps the rest.
 function realish(p: string): string {
+  // No real path is this deep, and walking up one like it means thousands of disk lookups.
+  if (p.length > 2048) return p;
   const tail: string[] = [];
   let cur = p;
   for (;;) {
@@ -225,7 +234,14 @@ function userVerdict(argv: string[], rules: UserRules): Verdict | undefined {
   const bare = unwrap(argv).join(" ");
   for (const action of ["deny", "ask", "classify"] as const) {
     const hit = rules[action].find((m) => m.test(raw) || m.test(bare));
-    if (hit) return { action, reason: `your ${action} rule "${hit.source}"`, ...(action === "ask" && { firm: true }) };
+    if (hit) {
+      return {
+        action,
+        reason: `your ${action} rule "${hit.source}"`,
+        class: action === "deny" ? "hard" : action === "ask" ? "firm" : "opaque",
+        ...(action === "ask" && { firm: true }),
+      };
+    }
   }
   return allowedBy(argv, rules.allow) ? ALLOW : undefined;
 }
@@ -263,11 +279,11 @@ const isGuarded = (p: string | undefined, scope: Scope) => !!p && scope.guarded.
 // the chat decider. Your own allow rules can replace that ask.
 const CONTEXT_FILES = new Set(["AGENTS.md", "AGENTS.override.md", "AGENTS.MD", "CLAUDE.md", "CLAUDE.MD"]);
 const isPiFile = (p: string | undefined, scope: Scope) => !!p && (p.split(/[\\/]/).some((part) => process.platform === "win32" ? part.toLowerCase() === ".pi" : part === ".pi") || CONTEXT_FILES.has(path.basename(p)) || (process.platform === "win32" && /^(agents(?:\.override)?|claude)\.md$/i.test(path.basename(p))) || scope.piDirs.some((d) => within(p, d)));
-const piAsk = (reason: string): Verdict => ({ action: "ask", reason, firm: true });
+const piAsk = (reason: string): Verdict => ({ action: "ask", reason, class: "firm", firm: true });
 const inTmp = (p: string) => TMP_DIRS.some((d) => within(p, d, true));
 // Provably inside the project or a temp directory.
 const isLocal = (p: string | undefined, scope: Scope) =>
-  !!p && ((!!scope.root && within(p, scope.root)) || inTmp(p) || scope.allowed.some((d) => within(p, d)));
+  !!p && ((!!scope.root && within(p, scope.root)) || TMP_DIRS.some((d) => within(p, d)) || scope.allowed.some((d) => within(p, d)));
 // /, a top-level directory, $HOME or a parent of it.
 export const isRootLike = (p: string) => p === "/" || path.dirname(p) === "/" || within(HOME, p) || (process.platform === "win32" && (
   path.resolve(p) === path.parse(path.resolve(p)).root ||
@@ -290,7 +306,10 @@ function folderFor(p: string | undefined): string | undefined {
 // An ask for a change outside the working directory, with the folder it could be allowed for.
 // The `dir` key is there even when no folder can be offered: such an ask is about a path, so it
 // never gets a command pattern.
-const outside = (reason: string, p: string | undefined): Verdict => ({ action: "ask", reason, dir: folderFor(p) });
+// A path the rules cannot resolve (`$D`, `t_$h.html`) is unknown, not outside, so it goes to the judges
+// on its merits. A known path outside needs the user's words, as does anything that deletes.
+const outside = (reason: string, p: string | undefined): Verdict => ({ action: "ask", reason, class: p ? "outward" : "opaque", dir: folderFor(p) });
+const outsideDelete = (reason: string, p: string | undefined): Verdict => ({ action: "ask", reason, class: "outward", dir: folderFor(p) });
 
 // ---- files of the session ----
 
@@ -346,6 +365,9 @@ const SECRET_PLACES = [
 ];
 const SECRET_NAMES =
   /^(id_(rsa|dsa|ecdsa|ed25519)(_[\w.-]+)?|.+\.(pem|key|p12|pfx|jks|keystore|kdbx)|\.env(\.[\w.-]+)?|credentials\.(json|ya?ml|toml|ini|csv|xml)|secrets?\.(json|ya?ml|toml|ini|env|txt)|.*service[-_]?(account|principal).*\.json|\.(netrc|npmrc|pypirc|git-credentials|vault-token|pgpass|htpasswd)|\.(bash|zsh)_history|.*\.keychain(-db)?)$/i;
+// A file name that is a credential in the right directory. With an unknown working directory the
+// directory is unknowable, so reading one of these bare names is judged, not allowed.
+const CREDENTIAL_BARE_NAMES = new Set(["credentials", "config", "id_rsa", "auth.json", "hosts.yml"]);
 
 // Your own credential files and folders: the config's secretPaths, absolute.
 let extraSecrets: string[] = [];
@@ -353,8 +375,103 @@ export function setSecretPaths(paths: string[]) {
   extraSecrets = paths.map((p) => p.replace(/\/+$/, "")).filter(Boolean);
 }
 
-function isSecretPath(p: string): boolean {
+// Bash brace expansion, used only when a credential path is checked. The corpus treats a single
+// alternative as an expansion too (`.a{w}s` is `.aws`), so every brace group is reduced.
+// The budget counts calls, not results: results collapse into duplicates, so a cap on them never
+// trips, and a guard that hangs freezes the whole session.
+function braceExpand(word: string, budget = { calls: 2000 }): string[] {
+  const m = /\{([^{}]*)\}/.exec(word);
+  if (!m || budget.calls-- <= 0) return [word];
+  const inner = m[1];
+  let parts: string[];
+  const numeric = /^(-?\d+)\.\.(-?\d+)$/.exec(inner);
+  const alpha = /^([A-Za-z])\.\.([A-Za-z])$/.exec(inner);
+  if (numeric) {
+    const from = Number(numeric[1]);
+    const to = Number(numeric[2]);
+    const step = from <= to ? 1 : -1;
+    parts = [];
+    for (let n = from; n !== to + step && parts.length < 32; n += step) parts.push(String(n));
+  } else if (alpha) {
+    const from = alpha[1].charCodeAt(0);
+    const to = alpha[2].charCodeAt(0);
+    const step = from <= to ? 1 : -1;
+    parts = [];
+    for (let n = from; n !== to + step && parts.length < 32; n += step) parts.push(String.fromCharCode(n));
+  } else if (inner.includes(",")) parts = inner.split(",");
+  else parts = [inner];
+  const pre = word.slice(0, m.index);
+  const post = word.slice(m.index + m[0].length);
+  const out: string[] = [];
+  for (const part of parts) {
+    if (out.length >= 128 || budget.calls <= 0) break;
+    out.push(...braceExpand(pre + part + post, budget));
+  }
+  return [...new Set(out)].slice(0, 128);
+}
+
+// Fill the wildcards in a word with the characters and short names that turn it into a credential
+// path: `auth.jso?` -> auth.json, `.docker/config.jso?` -> config.json, `hosts.y?l` -> hosts.yml.
+// The check only asks whether the glob could name a secret, so ordinary globs (.md, src/*.ts) stay out.
+const GLOB_FILL_BUDGET = 4000;
+// Paths a many-wildcard glob is tested against, when filling it in would be too much work.
+const WELL_KNOWN_SECRETS = [".ssh/id_rsa", ".ssh/id_ed25519", ".ssh/id_ecdsa", ".aws/credentials", ".pi/agent/auth.json", ".netrc", ".npmrc", ".pypirc", ".git-credentials", ".docker/config.json", ".config/gh/hosts.yml", ".kube/config", ".env", ".gnupg/secring.gpg", ".local/share/opencode/auth.json", ".codex/auth.json", ".claude/.credentials.json", "/proc/self/environ", "/etc/shadow"];
+function globNamesWellKnownSecret(glob: string): boolean {
+  // A bare run of wildcards says nothing: `cat *` in a project is not a credential read.
+  if ((glob.match(/[A-Za-z0-9_.-]{2,}/g) ?? []).length === 0) return false;
+  if (glob.length > 512) return false;
+  const escaped = (text: string) => text.replace(/\*+/g, "*").replace(/\[[^\]]*\]/g, "?").replace(/[.+^${}()|\\]/g, "\\$&").replace(/\*/g, "[^/]*").replace(/\?/g, "[^/]");
+  const segments = glob.replace(/\\/g, "/").replace(/\/+$/, "").split("/").filter(Boolean);
+  if (!segments.length) return false;
+  // Compare the glob's last segments with the same number of trailing segments of each
+  // well-known path, so the home prefix of an absolute glob does not have to match and
+  // `.a*/credentials` is tested exactly where it names a credential directory.
+  return WELL_KNOWN_SECRETS.some((s) => {
+    const secret = s.replace(/^\/+/, "").split("/").filter(Boolean);
+    if (!secret.length || segments.length < secret.length) return false;
+    const pattern = segments.slice(-secret.length).join("/");
+    // A segment with no literal character says nothing: `cat *` and `cat */*` name no credential.
+    if (!/[A-Za-z0-9]/.test(pattern)) return false;
+    try {
+      return new RegExp(`^${escaped(pattern)}$`, "i").test(secret.join("/"));
+    } catch {
+      return false;
+    }
+  });
+}
+function globFill(word: string): string[] {
+  const stars = ["", "n", "x", "json", "yml", "yaml", "pem", "key", "rsa", "ed25519", "credentials", "config", "auth"];
+  const ones = ["n", "m", "l", "x", "1", "a", "s", "e", "r", "t", "o", "u"];
+  const out: string[] = [];
+  // Counts work, not results: wildcards multiply, and a guard that hangs freezes the session.
+  let budget = GLOB_FILL_BUDGET;
+  const walk = (prefix: string, rest: string, depth: number) => {
+    if (budget-- <= 0 || depth > 10) return;
+    const m = /[?*]|\[([^\]]*)\]/.exec(rest);
+    if (!m) { out.push(prefix + rest); return; }
+    const before = prefix + rest.slice(0, m.index);
+    const after = rest.slice(m.index + m[0].length);
+    if (m[0] === "?") for (const fill of ones) walk(before + fill, after, depth + 1);
+    else if (m[0] === "*") for (const fill of stars) walk(before + fill, after, depth + 1);
+    else {
+      const chars = m[1].startsWith("!") ? ones : m[1].replace(/\\/g, "").split("");
+      for (const fill of chars.slice(0, 12)) walk(before + fill, after, depth + 1);
+    }
+  };
+  walk("", word, 0);
+  return [...new Set(out)];
+}
+
+export function isSecretPath(p: string): boolean {
   p = slash(p);
+  if (p.includes("{")) return braceExpand(p).some((x) => isSecretPath(x.replace(/[{}]/g, "")));
+  if (/[?*\[]/.test(p)) {
+    // A glob that names a well-known credential path says so however few wildcards it has.
+    if (globNamesWellKnownSecret(p)) return true;
+    // Past this many wildcards, filling them in cannot finish and the word is rarely a path at all.
+    if ((p.match(/[?*\[]/g) ?? []).length > 3) return false;
+    return globFill(p).some(isSecretPath);
+  }
   if (process.platform === "win32") p = p.toLowerCase();
   if (extraSecrets.some((s) => { s = slash(s); if (process.platform === "win32") s = s.toLowerCase(); return p === s || p.startsWith(s + "/"); })) return true;
   const name = path.basename(p);
@@ -365,15 +482,97 @@ function isSecretPath(p: string): boolean {
   return SECRET_PLACES.some((place) => place.test(p) || (process.platform === "win32" && place.test(p.replace(/^[a-z]:/i, "")))) || SECRET_NAMES.test(name);
 }
 
+// Directories that hold credentials. A recursive reader of one of these prints secrets even when
+// no single operand names a credential file (`grep -r key ~/.pi/agent`).
+const CREDENTIAL_DIRS = [
+  /\/\.(ssh|aws|gnupg|kube|azure|oci|password-store)(\/|$)/,
+  /\/\.config\/(gcloud|op|gh)(\/|$)/,
+  /\/\.docker(\/|$)/,
+  /\/\.cargo(\/|$)/,
+  /\/\.terraform\.d(\/|$)/,
+  /\/\.pi\/agent(\/|$)/,
+  /\/\.(codex|claude)(\/|$)/,
+  /\/\.local\/share\/opencode(\/|$)/,
+  /\/Library\/Keychains(\/|$)/,
+  /^\/etc(\/|$)/,
+  /^\/proc\//,
+];
+const CREDENTIAL_CHILDREN = [".ssh", ".aws", ".gnupg", ".kube", ".pi/agent", ".config/gh", ".docker", ".cargo"];
+/** True for a directory (or a home directory root) that holds credential files. */
+export function isCredentialDirectory(p: string | undefined): boolean {
+  if (!p) return false;
+  let s = slash(p).replace(/\/+$/, "");
+  if (!s) return false;
+  if (process.platform === "win32") s = s.toLowerCase();
+  const home = process.platform === "win32" ? slash(HOME).toLowerCase() : slash(HOME);
+  // HOME itself, and any directory above it, contains the credential folders of a home.
+  if (s === home || within(home, s)) return true;
+  if (CREDENTIAL_DIRS.some((re) => re.test(s) || re.test(s + "/"))) return true;
+  // A home-shaped root (the eval fake home, a copied home) holds credentials in child folders.
+  // Only a child that actually exists counts; appending `.ssh` to every project path would make
+  // every project folder look like a credential store.
+  return CREDENTIAL_CHILDREN.some((child) => {
+    const dir = slash(path.join(s, child));
+    return fs.existsSync(dir) && CREDENTIAL_DIRS.some((re) => re.test(dir.replace(/\/+$/, "") + "/"));
+  });
+}
+
+// Environment variables whose value is a credential rather than a setting. Matching one word of
+// the name keeps NODE_ENV, PATH and HOME out, and strips a suffix that turns the value into a
+// path (`OPENAI_API_KEY_FILE`).
+const SAFE_ENV = new Set([
+  "PATH", "PATHEXT", "HOME", "USERPROFILE", "PWD", "OLDPWD", "SHELL", "TERM", "TERM_PROGRAM", "LANG", "LANGUAGE",
+  "LC_ALL", "LC_CTYPE", "TMP", "TEMP", "TMPDIR", "NODE_ENV", "HOSTNAME", "COMPUTERNAME", "USER", "USERNAME", "LOGNAME",
+  "SHLVL", "RANDOM", "PPID", "SHELLOPTS", "BASHOPTS", "COLUMNS", "LINES", "OSTYPE", "MACHTYPE", "HOSTTYPE", "EDITOR",
+  "VISUAL", "PAGER", "DISPLAY", "XAUTHORITY", "NO_COLOR", "FORCE_COLOR", "CI", "PS1", "VIRTUAL_ENV", "CONDA_PREFIX",
+]);
+const SECRET_ENV_WORD = /^(key|keys|apikey|token|tokens|secret|secrets|password|passwd|passphrase|credential|credentials|auth|authorization|private|signing|salt|cookie|cookies|session|dsn|pat|jwt|bearer)$/i;
+/** True for a variable name that looks like it holds a token: OPENAI_API_KEY, GITHUB_TOKEN. */
+export function isSecretEnvName(name: string): boolean {
+  const upper = name.toUpperCase();
+  if (SAFE_ENV.has(upper)) return false;
+  const value = upper.replace(/_(FILE|PATH|DIR|FOLDER|NAME|PREFIX|SUFFIX|TYPE|URL)$/, "");
+  if (SAFE_ENV.has(value)) return false;
+  return value.split(/_+/).some((word) => SECRET_ENV_WORD.test(word));
+}
+
+// A command that prints the whole environment or a secret variable from it. Reading one of these
+// into the transcript hands the agent every token the shell can see, so the model judges it.
+function printsSecrets(name: string, args: string[]): boolean {
+  if (["export", "declare", "typeset", "readonly"].includes(name)) {
+    if (!args.length) return true;
+    if (args.includes("-p")) return true;
+    // -x alone lists the exported variables; with an assignment it only sets one.
+    return args.includes("-x") && !args.some((a) => /^[A-Za-z_]\w*=/.test(a));
+  }
+  if (name === "set") return args.length === 0;
+  if (name === "compgen") return args.some((a) => a === "-e" || a === "-v");
+  if (name === "printenv") return args.some((a) => !a.startsWith("-") && isSecretEnvName(a));
+  if (name === "echo" || name === "printf") {
+    for (const arg of args) {
+      for (const m of arg.matchAll(/\$\{(\w+)\}|\$(\w+)/g)) {
+        if (isSecretEnvName(m[1] ?? m[2])) return true;
+      }
+    }
+  }
+  return false;
+}
+
+// A write target under .git/hooks runs on the next git command: persistence outside the file.
+const isGitHook = (p: string | undefined) => !!p && /(^|[\\/])\.git[\\/]hooks([\\/]|$)/i.test(p);
+const gitHookWrite = (target: string) => outwardClassify(`writes the git hook ${target}, which runs on your next git command`);
+
 // The credential file a shell word names, if any. Handles `--file=path`, curl's `@file` and
 // git's `rev:path`. In a command, words with spaces and URLs are text, not paths.
 function secretIn(word: string, scope: Scope, isPath = false): string | undefined {
   if (!isPath && (/\s/.test(word) || /^[a-z][a-z0-9+.-]*:\/\//i.test(word))) return undefined;
   const text = word.replace(/^[^=/]*=/, "").replace(/^@/, "");
-  for (const candidate of new Set([text, text.slice(text.lastIndexOf(":") + 1)])) {
-    if (!candidate || candidate.startsWith("-")) continue;
-    const p = resolveWord(candidate, scope);
-    if (isSecretPath(expandHome(candidate)) || (p && isSecretPath(p))) return candidate;
+  for (const expanded of braceExpand(text)) {
+    for (const candidate of new Set([expanded, expanded.slice(expanded.lastIndexOf(":") + 1)])) {
+      if (!candidate || candidate.startsWith("-")) continue;
+      const p = resolveWord(candidate, scope);
+      if (isSecretPath(expandHome(candidate)) || (p && isSecretPath(p))) return candidate;
+    }
   }
   return undefined;
 }
@@ -414,7 +613,7 @@ function findReads(args: string[], scope?: Scope): boolean {
   return true;
 }
 
-// The credential file a simple command would read, if any.
+// The credential file or credential directory a simple command would read, if any.
 function credentialRead(name: string, args: string[], cmd: Simple, scope: Scope): string | undefined {
   if (NAMES_ONLY.has(name)) return undefined;
   // An in-place edit shows nothing, and a destination is written, not read.
@@ -428,7 +627,29 @@ function credentialRead(name: string, args: string[], cmd: Simple, scope: Scope)
     const secret = secretIn(word, scope);
     if (secret) return secret;
   }
+  // A recursive reader of a directory that holds credentials prints them even though the path
+  // itself is not a credential file. `ls` stays out: it shows names, not contents.
+  if (readsDirectoryRecursively(name, args)) {
+    for (const word of [...words, ...(cmd.in ?? [])]) {
+      const p = resolveWord(word, scope);
+      if (!p) continue;
+      const stat = fs.statSync(p, { throwIfNoEntry: false });
+      // A file named inside a credential folder is a credential read only when it is one; a
+      // directory (or a missing path that is a credential folder) is searched below.
+      if (stat && !stat.isDirectory()) continue;
+      if (isCredentialDirectory(p)) return word;
+    }
+  }
   return undefined;
+}
+
+// grep -r and rg search below their operands; tar c and cp/rsync -r copy a whole directory.
+function readsDirectoryRecursively(name: string, args: string[]): boolean {
+  if (name === "rg" || name === "ag" || name === "ack") return true;
+  if (name === "grep" || name === "egrep" || name === "fgrep") return args.some((a) => /^-[a-zA-Z]*[rR]/.test(a) || a === "--recursive" || a === "--dereference-recursive");
+  if (name === "tar") return args.some((a) => /^[a-zA-Z]*c/.test(a) && !a.startsWith("--")) || args.includes("--create");
+  if (name === "cp" || name === "rsync") return args.some((a) => /^-[a-zA-Z]*[rR]/.test(a) || a === "--recursive");
+  return false;
 }
 
 // ---- parser ----
@@ -443,6 +664,9 @@ export interface Simple {
   append?: string[];
   // Reads a heredoc: for a shell or interpreter the body is code.
   heredoc?: boolean;
+  // The bodies of the heredocs this command reads, in order and as written. The parser already
+  // skips them as data; keeping them lets runTargets see code fed to a shell or interpreter.
+  heredocBodies?: string[];
   // The heredoc body holds a variable or a command substitution, so it is not literal text.
   expands?: boolean;
   // Runs in a subshell: inside a command substitution, or as part of a pipeline or a background
@@ -607,7 +831,9 @@ export function parse(command: string, depth = 0): Parsed {
       while (c === "\n" && heredocs.length) {
         const doc = heredocs.shift()!;
         const end = new RegExp(`^\\s*${doc.delimiter.replace(/[.\-]/g, "\\$&")}\\s*$`, "m").exec(s.slice(i + 1));
-        if (!doc.quoted) heredocBody(end ? s.slice(i + 1, i + 1 + end.index) : s.slice(i + 1), doc.owner);
+        const body = end ? s.slice(i + 1, i + 1 + end.index) : s.slice(i + 1);
+        if (!doc.quoted) heredocBody(body, doc.owner);
+        (doc.owner.heredocBodies ??= []).push(body);
         i = end ? i + end.index + end[0].length : s.length;
       }
     } else if (c === "&" || c === "|") {
@@ -640,7 +866,7 @@ export const READ_ONLY = new Set(
    lscpu lsblk lsusb lspci lsmod findmnt readlink realpath basename dirname sort uniq cut tr jq yq
    column diff cmp comm nl tac rev fold paste join seq true false test [ sleep export unset wait
    sha256sum sha1sum md5sum b3sum xxd hexdump od strings nm ldd man tldr tokei cloc fastfetch
-   journalctl dmesg ss dig nslookup ping getent locale zcat xzcat bzcat zstdcat
+   journalctl dmesg ss dig nslookup host traceroute tracert whois ping getent locale zcat xzcat bzcat zstdcat
    set shopt local declare typeset readonly break continue return exit shift :`.split(/\s+/),
 );
 
@@ -657,7 +883,7 @@ const SUBCOMMANDS: Record<string, { allow: string; ask?: Record<string, string> 
     allow: `status diff log show rev-parse rev-list ls-files ls-tree ls-remote blame describe shortlog
       grep cat-file merge-base name-rev show-ref symbolic-ref count-objects check-ignore
       add commit switch fetch pull merge rebase cherry-pick revert mv init clone apply am bisect
-      submodule worktree sparse-checkout notes range-diff format-patch whatchanged version help`,
+      submodule worktree sparse-checkout notes range-diff format-patch archive bundle whatchanged version help`,
     ask: {
       push: "git push is visible to others",
       "filter-branch": "rewrites git history",
@@ -727,6 +953,9 @@ const ALWAYS_ASK: Record<string, string> = {
   twine: "uploads a package", fdisk: "edits disk partitions", parted: "edits disk partitions", sgdisk: "edits disk partitions",
 };
 
+// Commands that delete or overwrite the paths xargs feeds them from stdin.
+const DESTRUCTIVE_XARGS = new Set(["rm", "rmdir", "unlink", "mv", "chmod", "chown", "chgrp", "tee", "dd", "shred", "truncate", "patch"]);
+
 // Commands whose operands are written to. "last" means only the final operand is a destination.
 const WRITERS: Record<string, "all" | "last"> = {
   cp: "last", ln: "last", install: "last", rsync: "last",
@@ -744,6 +973,40 @@ const CONTENT_WRITERS = new Set(["tee", "truncate", "shred", "patch"]);
 // an option that loads a file; it often just sets a heap size.
 const LOADS_CODE = /^(LD_PRELOAD|LD_AUDIT|DYLD_INSERT_LIBRARIES|BASH_ENV|ENV|NODE_OPTIONS|PERL5OPT|RUBYOPT)=(.*)$/s;
 const NODE_LOADS = /(^|\s)(-r|--require|--import|--loader|--experimental-loader)(=|\s|$)/;
+// Variables that change what a command runs or where it writes when set on the command line or
+// exported: git's environment config and program hooks, make's flags, an interpreter's import or
+// startup path, a compiler wrapper, a package manager's registry. A plain setting such as
+// NODE_ENV=test, CI=1 or DEBUG=x is not one of them.
+const ENV_FLAGS = /^(MAKEFLAGS|MFLAGS|GOFLAGS|GIT_CONFIG_\w+|NPM_CONFIG_\w+|YARN_\w+)$/i;
+const ENV_PATH = /^(GIT_DIR|GIT_WORK_TREE|GIT_CONFIG|GIT_EXEC_PATH|GIT_TEMPLATE_DIR|PYTHONSTARTUP|PYTHONPATH|PYTHONHOME|NODE_PATH|LD_LIBRARY_PATH)$/;
+const ENV_PROGRAM = /^(PAGER|EDITOR|VISUAL|LESSOPEN|LESSCLOSE|MANPAGER|GIT_PAGER|GIT_EDITOR|GIT_SSH|GIT_SSH_COMMAND|GIT_EXTERNAL_DIFF|RUSTC|RUSTC_WRAPPER|CARGO_BUILD_RUSTC_WRAPPER|CC|CXX|MAKE|AR)$/;
+// The reason an assignment changes what a command runs, if it does. `scope` is the working
+// directory the assignment is made in, so a project-relative import path stays ordinary.
+function envLoadsCode(word: string, scope: Scope): string | undefined {
+  const m = /^([A-Za-z_][A-Za-z0-9_]*)=(.*)$/s.exec(word);
+  if (!m) return undefined;
+  const name = m[1];
+  const value = m[2].replace(/^(["'])([\s\S]*)\1$/, "$2");
+  const loader = LOADS_CODE.exec(word);
+  if (loader && (loader[1] !== "NODE_OPTIONS" || NODE_LOADS.test(loader[2]))) return `sets ${loader[1]}, which loads other code into the program`;
+  if (ENV_FLAGS.test(name)) return `sets ${name}, which changes what the command runs`;
+  if (ENV_PATH.test(name)) {
+    if (!value) return undefined;
+    // A path built at run time cannot be proven to stay under the project.
+    if (/[$`]/.test(value)) return `sets ${name} to a path computed at run time`;
+    const p = resolveWord(value, scope);
+    const here = scope.cwd;
+    if (!p || !here || !(within(p, here) || (!!scope.root && within(p, scope.root)))) return `sets ${name} to a path outside the working directory`;
+    return undefined;
+  }
+  if (ENV_PROGRAM.test(name)) {
+    // A bare program name comes from PATH; a path, an expansion or a pipe names a program of its
+    // own, which the rules cannot see.
+    if (!/[$`\\/|~]/.test(value)) return undefined;
+    return `sets ${name} to a program the rules cannot see`;
+  }
+  return undefined;
+}
 const WRAPPERS = new Set(["env", "nice", "ionice", "timeout", "time", "command", "builtin", "nohup", "setsid", "stdbuf", "exec", "chrt", "taskset"]);
 // Wrappers that run the same program with the same environment and PATH lookup.
 const SAME_PROGRAM_WRAPPERS = new Set(["timeout", "time", "nice", "ionice", "nohup", "setsid", "stdbuf"]);
@@ -763,24 +1026,249 @@ function afterFlags(args: string[], takesValue: RegExp): string[] {
   return args.slice(i);
 }
 const hasFlag = (args: string[], short: string, long?: string) =>
-  args.some((a) => (long && a === long) || (/^-[a-zA-Z]+$/.test(a) && a.includes(short)));
+  args.some((a) => (long !== undefined && longOption(a, long)) || (/^-[a-zA-Z]+$/.test(a) && a.includes(short)));
 
-// ---- rules for one simple command ----
+// GNU long options accept any unambiguous prefix of the option they name: `sort --outp=` is
+// `sort --output=`, and git accepts `--outp` too. A spelling that is a different option of the
+// tool in its own right (`curl --head`, which is not `--header`) is not an abbreviation.
+const LONG_MIN_ABBREVIATION = 5;
+const LONG_IS_ANOTHER_OPTION = new Set(["--head", "--hea"]);
+function longOption(a: string, name: string): boolean {
+  if (a === name) return true;
+  if (!name.startsWith("--") || !a.startsWith("--")) return false;
+  const flag = a.includes("=") ? a.slice(0, a.indexOf("=")) : a;
+  if (flag === name) return true;
+  return flag.length >= LONG_MIN_ABBREVIATION && flag.length < name.length && name.startsWith(flag) && !LONG_IS_ANOTHER_OPTION.has(flag);
+}
+
+// The value of an option, attached (`--out=/x`, `--outp /x`, `-o/x`) or as the next word.
+function optionArg(args: string[], ...names: string[]): string | undefined {
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    for (const name of names) {
+      if (a === name) return args[i + 1];
+      if (name.startsWith("--")) {
+        if (a.startsWith(name + "=")) return a.slice(name.length + 1);
+        if (longOption(a, name)) return a.includes("=") ? a.slice(a.indexOf("=") + 1) : args[i + 1];
+      }
+      if (/^-[A-Za-z]$/.test(name) && a.startsWith(name) && a.length > name.length) return a.slice(name.length);
+    }
+  }
+  return undefined;
+}
+
+// Every value an option takes, in order. `sed -e a -e b` reads both scripts, not only the first.
+function optionArgs(args: string[], ...names: string[]): string[] {
+  const out: string[] = [];
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    let used = false;
+    for (const name of names) {
+      if (a === name) {
+        if (args[i + 1] !== undefined) out.push(args[++i]);
+        used = true;
+        break;
+      }
+      if (name.startsWith("--") && longOption(a, name)) {
+        if (a.includes("=")) out.push(a.slice(a.indexOf("=") + 1));
+        else if (args[i + 1] !== undefined) out.push(args[++i]);
+        used = true;
+        break;
+      }
+      if (/^-[A-Za-z]$/.test(name) && a.startsWith(name) && a.length > name.length) {
+        out.push(a.slice(name.length));
+        used = true;
+        break;
+      }
+    }
+    if (used) continue;
+  }
+  return out;
+}
+
+// The words left after dropping the values of the given options, so an option value is not read
+// as a path operand (`cp -t DIR a`: DIR is the destination, not a source).
+function withoutOptionValues(args: string[], ...names: string[]): string[] {
+  const out: string[] = [];
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    let used = false;
+    for (const name of names) {
+      if (a === name) {
+        i++;
+        used = true;
+        break;
+      }
+      if (name.startsWith("--") && longOption(a, name)) {
+        if (!a.includes("=")) i++;
+        used = true;
+        break;
+      }
+      if (/^-[A-Za-z]$/.test(name) && a.startsWith(name) && a.length > name.length) {
+        used = true;
+        break;
+      }
+    }
+    if (!used) out.push(a);
+  }
+  return out;
+}
+
+// A file a command writes, with the same floors as every other write target.
+function writePathVerdict(name: string, target: string, scope: Scope): Verdict | undefined {
+  const p = resolveWord(target, scope);
+  if (p && DEV_SINKS.test(p)) return undefined;
+  if (isGuarded(p, scope)) return guardAsk(`${name} changes the auto-mode guard's own files`);
+  if (isPiFile(p, scope)) return piAsk(`${name} changes Pi's own files: ${target}`);
+  if (isGitHook(p)) return gitHookWrite(target);
+  if (!isLocal(p, scope)) return outside(`${name} writes outside the working directory: ${target}`, p);
+  return undefined;
+}
+
+// The other end of a link. A link to a home, a credential store, Pi's files or the guard lets a
+// later project-looking path reach it, so it asks now, while the target is still visible.
+function linkVerdict(name: string, target: string, scope: Scope): Verdict | undefined {
+  let verdict: Verdict | undefined;
+  const alternatives = braceExpand(expandHome(target));
+  for (const alternative of alternatives) {
+    const p = resolveWord(alternative, scope);
+    if (!p) {
+      verdict = worst(verdict ?? ALLOW, classify(`${name} links to a path the rules cannot resolve: ${target}`));
+      continue;
+    }
+    if (DEV_SINKS.test(p)) continue;
+    if (isGuarded(p, scope)) return guardAsk(`${name} links to the auto-mode guard's own files: ${target}`);
+    if (isPiFile(p, scope)) return guardAsk(`${name} links to Pi's own files: ${target}`);
+    if (isSecretPath(alternative) || isSecretPath(p) || (psDirExists(p) && isCredentialDirectory(p)) || (isRootLike(p) && !inTmp(p))) {
+      return criticalAsk(`${name} links to a credential location or its parent: ${target}`);
+    }
+    if (!isLocal(p, scope)) verdict = worst(verdict ?? ALLOW, outside(`${name} links to a target outside the working directory: ${target}`, p));
+  }
+  return verdict;
+}
+
+// Formatters that rewrite their operands in place, and the flags that make them do it.
+const FORMATTERS: Record<string, (args: string[]) => boolean> = {
+  prettier: (args) => args.some((a) => a === "--write" || a === "-w"),
+  black: (args) => !args.some((a) => /^(--check|--diff|--code)$/.test(a)),
+  isort: (args) => !args.some((a) => /^--(check|check-only|diff|show-files|show-config)/.test(a)),
+  shfmt: (args) => args.some((a) => a === "-w" || a === "--write"),
+  rustfmt: (args) => !args.some((a) => /^--(check|emit|print)/.test(a)),
+  eslint: (args) => args.some((a) => a === "--fix") && !args.includes("--fix-dry-run"),
+  ruff: (args) => args.some((a) => a === "--fix") || (operands(args)[0] === "format" && !args.some((a) => a === "--check" || a === "--diff")),
+  biome: (args) => args.some((a) => a === "--write" || a === "--apply"),
+  stylua: (args) => !args.some((a) => a === "--check"),
+  gofmt: (args) => args.some((a) => a === "-w"),
+};
+const FORMATTER_VALUE_FLAGS = new Set([
+  "--config", "--config-path", "--config-precedence", "--parser", "--print-width", "--tab-width", "--trailing-comma",
+  "--ignore-path", "--plugin", "--stdin-filepath", "--cache-location", "--loglevel", "--range-start", "--range-end",
+  "--line-length", "--target-version", "--include", "--exclude", "--ext", "--rulesdir", "--resolve-plugins-relative-to",
+  "--output-file", "--format", "--stdin-filename", "--log-level", "-o", "--output", "--cache", "--cache-dir",
+]);
+
+// The operands of a formatter: the words it rewrites, not the values of its own options.
+function formatterOperands(args: string[]): string[] {
+  const out: string[] = [];
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (a === "--") { out.push(...args.slice(i + 1)); break; }
+    if (a.startsWith("--")) {
+      const eq = a.indexOf("=");
+      const flag = eq > 0 ? a.slice(0, eq) : a;
+      if (eq < 0 && FORMATTER_VALUE_FLAGS.has(flag)) i++;
+      continue;
+    }
+    if (a.startsWith("-") && a !== "-") {
+      if (FORMATTER_VALUE_FLAGS.has(a)) i++;
+      continue;
+    }
+    out.push(a);
+  }
+  return out;
+}
+
+function formatterVerdict(name: string, args: string[], scope: Scope): Verdict | undefined {
+  const writes = FORMATTERS[name]?.(args);
+  if (!writes) return undefined;
+  for (const target of formatterOperands(args)) {
+    const p = resolveWord(target, scope);
+    if (!p || DEV_SINKS.test(p)) continue;
+    if (isGuarded(p, scope)) return guardAsk(`${name} changes the auto-mode guard's own files`);
+    if (isPiFile(p, scope)) return piAsk(`${name} changes Pi's own files: ${target}`);
+    if (isGitHook(p)) return gitHookWrite(target);
+    // The formatter rewrites an existing file. A path that does not exist is not rewritten, so it
+    // cannot widen the guard just by being named.
+    if (!isLocal(p, scope) && fs.existsSync(p)) return outside(`${name} writes outside the working directory: ${target}`, p);
+  }
+  return undefined;
+}
+
+// Tools that load a config or script file named by a flag. A path outside the project is a config
+// the guard cannot see, so it stays with the model.
+function configOption(name: string, args: string[]): string | undefined {
+  const pick = (...flags: string[]) => {
+    for (const f of flags) { const v = optionArg(args, f); if (v !== undefined) return v; }
+    return undefined;
+  };
+  if (name === "make") return pick("-f", "--file", "--makefile");
+  if (name === "cmake") return pick("-P", "--script");
+  if (name === "eslint") return pick("--config", "-c") ?? pick("--rulesdir", "--resolve-plugins-relative-to");
+  if (name === "vitest" || name === "jest" || name === "mocha") return pick("--config", "-c");
+  if (name === "pytest") {
+    const config = pick("-c");
+    if (config !== undefined) return config;
+    // -p names a plugin module; only a path-like value can name a file outside the project.
+    const plugin = pick("-p");
+    return plugin && /[\\/]/.test(plugin) ? plugin : undefined;
+  }
+  if (name === "tox") return pick("-c", "--conf");
+  return undefined;
+}
+
+function configVerdict(name: string, args: string[], scope: Scope): Verdict | undefined {
+  const target = configOption(name, args);
+  if (target === undefined) return undefined;
+  const p = resolveWord(target, scope);
+  if (!p || !isLocal(p, scope)) return outwardClassify(`runs config from outside the working directory: ${target}`);
+  return undefined;
+}
+
 
 function writeTargets(cmd: string, args: string[], scope: Scope, literalInput = false): Verdict {
-  const paths = FIRST_OPERAND_NOT_PATH.has(cmd) ? operands(args).slice(1) : operands(args);
-  const sources = paths.slice(0, -1);
-  const dest = paths.length > 1 ? resolveWord(paths.at(-1)!, scope) : undefined;
-  const intoDir = COPIERS.has(cmd) && paths.length > 1 && (sources.length > 1 || paths.at(-1)!.endsWith("/") || (!!dest && fs.statSync(dest, { throwIfNoEntry: false })?.isDirectory()));
-  const targets = WRITERS[cmd] === "last" ? paths.slice(-1) : paths;
+  // `cp -t DIR a b` and `install --target-directory DIR a b` name the destination itself; every
+  // remaining word is a source and its basename lands inside DIR.
+  const targetDir = COPIERS.has(cmd) ? optionArg(args, "-t", "--target-directory") : undefined;
+  const given = operands(targetDir === undefined ? args : withoutOptionValues(args, "-t", "--target-directory"));
+  const paths = FIRST_OPERAND_NOT_PATH.has(cmd) ? given.slice(1) : given;
+  const sources = targetDir !== undefined ? paths : paths.slice(0, -1);
+  const destWord = targetDir !== undefined ? targetDir : paths.at(-1);
+  const dest = destWord !== undefined && (targetDir !== undefined || paths.length > 1) ? resolveWord(destWord, scope) : undefined;
+  const intoDir = targetDir !== undefined || (COPIERS.has(cmd) && paths.length > 1 && (sources.length > 1 || paths.at(-1)!.endsWith("/") || (!!dest && fs.statSync(dest, { throwIfNoEntry: false })?.isDirectory())));
+  // For a link, the first operand is the other end, not content that is read. A link to a home,
+  // a credential store, Pi's files or the guard must ask while that target is still visible.
+  // `cp -s`/`cp -l` make a link as well, so they take the same check as ln.
+  let link: Verdict | undefined;
+  if (cmd === "ln" || (cmd === "cp" && (hasFlag(args, "s", "--symbolic-link") || hasFlag(args, "l", "--link")))) {
+    for (const source of sources) {
+      const v = linkVerdict(cmd, source, scope);
+      if (v && (v.locked || v.critical)) return v;
+      if (v) link = link ? worst(link, v) : v;
+    }
+  }
+  const targets = intoDir ? [destWord!] : WRITERS[cmd] === "last" ? paths.slice(-1) : paths;
+  let hook: Verdict | undefined;
   for (const t of targets) {
-    // Copied into a directory, the files land inside it: `cp a.rs /tmp` writes /tmp/a.rs.
-    const written = intoDir && t === paths.at(-1) && dest ? sources.map((s) => path.join(dest, path.basename(s))) : [resolveWord(t, scope)];
+    // Copied into a directory, the files land inside it: `cp a.rs /tmp` writes /tmp/a.rs. The
+    // directory itself is checked too, since `cp -t /etc a` writes inside /etc.
+    const landing = intoDir && dest ? sources.map((s) => path.join(dest, path.basename(s))) : [];
+    const written = intoDir && dest ? [dest, ...landing] : [resolveWord(t, scope)];
     for (const p of written) {
       if (p && DEV_SINKS.test(p)) continue;
       if (isGuarded(p, scope)) return guardAsk(`${cmd} changes the auto-mode guard's own files`);
       if (isPiFile(p, scope)) return piAsk(`${cmd} changes Pi's own files: ${t}`);
-      if (!isLocal(p, scope)) return outside(`${cmd} writes outside the working directory: ${t}`, p);
+      if (isGitHook(p)) hook ??= gitHookWrite(t);
+      if (!isLocal(p, scope)) return cmd === "mkdir" ? { ...outside(`mkdir creates a folder outside the working directory: ${t}`, p), class: "opaque" } : outside(`${cmd} writes outside the working directory: ${t}`, p);
     }
   }
   if (COPIERS.has(cmd) && paths.length > 1) {
@@ -795,7 +1283,7 @@ function writeTargets(cmd: string, args: string[], scope: Scope, literalInput = 
     // Appending literal text leaves the file's origin as it was.
     if (!(literal && hasFlag(args, "a", "--append"))) for (const t of targets) note(resolveWord(t, scope), literal ? "authored" : "other", scope);
   }
-  return ALLOW;
+  return worst(hook ?? ALLOW, link ?? ALLOW);
 }
 
 function rm(args: string[], scope: Scope): Verdict {
@@ -804,12 +1292,15 @@ function rm(args: string[], scope: Scope): Verdict {
   for (const t of operands(args)) {
     const p = resolveWord(t, scope);
     const bare = BARE_GLOB.test(path.basename(t));
-    if (recursive && p && (isRootLike(p) || (bare && isRootLike(path.dirname(p))))) {
+    // A path held in a variable can be relative to a directory the rules followed; only a path
+    // written out is certain enough for the hard deny, and anything else still asks.
+    const held = /[$`]/.test(t);
+    if (recursive && p && !held && (isRootLike(p) || (bare && isRootLike(path.dirname(p))))) {
       return deny(`rm -r of ${t} would wipe a home or system directory`);
     }
     if (isGuarded(p, scope)) verdict = worst(verdict, guardAsk("rm deletes the auto-mode guard's own files"));
     else if (isPiFile(p, scope)) verdict = worst(verdict, piAsk(`rm deletes Pi's own files: ${t}`));
-    else if (!isLocal(p, scope)) verdict = worst(verdict, outside(`rm deletes outside the working directory: ${t}`, p));
+    else if (!isLocal(p, scope)) verdict = worst(verdict, outsideDelete(`rm deletes outside the working directory: ${t}`, p));
     else if (recursive && scope.root && (p === scope.root || (bare && path.dirname(p!) === scope.root) || /(^|[\\/])\.git([\\/]|$)/i.test(p!))) {
       verdict = worst(verdict, ask(`rm -r of ${t} deletes the whole project or its git data`));
     }
@@ -817,18 +1308,66 @@ function rm(args: string[], scope: Scope): Verdict {
   return verdict;
 }
 
+// Git config keys that run a command, load a file, or redirect where a later command goes. Setting
+// one is persistence even when the config file itself is inside the checkout.
+function gitConfigRuns(key: string, value: string | undefined): boolean {
+  const k = key.toLowerCase();
+  if (/^core\.(hookspath|sshcommand|fsmonitor|pager|editor|gitproxy|askpass|attributesfile)$/.test(k)) return true;
+  if (/^diff\.external$/.test(k) || /^diff\..*\.textconv$/.test(k)) return true;
+  if (/^filter\./.test(k)) return true;
+  if (/^alias\./.test(k)) return /^!/.test(value ?? "");
+  if (/^credential\./.test(k) || /^http\.proxy$/.test(k) || /^sequence\.editor$/.test(k) || /^gpg\.program$/.test(k)) return true;
+  if (/^url\..*\.(push)?insteadof$/.test(k) || /^include\.path$/.test(k) || /^includeif\..*\.path$/.test(k)) return true;
+  if (/^merge\..*\.driver$/.test(k) || /^diff\..*\.command$/.test(k) || /^remote\..*\.(url|pushurl|uploadpack|receivepack)$/.test(k) || /^gpg\..*\.program$/.test(k)) return true;
+  return false;
+}
+
+// The first operand after `git worktree add`, skipping its own option values. That operand is the
+// path of the new checkout.
+function worktreeAddTarget(rest: string[]): string | undefined {
+  for (let i = 0; i < rest.length; i++) {
+    const a = rest[i];
+    if (a === "-b" || a === "-B" || a === "--reason" || a === "--orphan") { i++; continue; }
+    if (a.startsWith("-")) continue;
+    return a;
+  }
+  return undefined;
+}
+
+function gitCloneTarget(rest: string[]): string | undefined {
+  const valueFlags = new Set(["-b", "--branch", "--depth", "-o", "--origin", "--reference", "--separate-git-dir", "--template", "--jobs", "-c", "--config", "--upload-pack", "--filter"]);
+  const words: string[] = [];
+  for (let i = 0; i < rest.length; i++) {
+    const a = rest[i];
+    if (valueFlags.has(a)) { i++; continue; }
+    if (a.startsWith("-")) continue;
+    words.push(a);
+  }
+  return words[1];
+}
+
 function git(args: string[], scope: Scope): Verdict {
-  // Skip global options to find the subcommand.
+  // Skip global options to find the subcommand. -c and --config-env can name a command git runs.
   let i = 0;
   while (i < args.length && args[i].startsWith("-")) {
     if (args[i] === "-C") {
       if (!isLocal(resolveWord(args[i + 1] ?? "", scope), scope)) return classify("git on a repository outside the working directory");
       i += 2;
-    } else i += args[i] === "-c" ? 2 : 1;
+    } else if (args[i] === "-c" || args[i] === "--config-env" || args[i].startsWith("--config-env=")) {
+      const fromEnv = args[i].startsWith("--config-env");
+      const raw = args[i] === "-c" || !args[i].includes("=") ? args[i + 1] : args[i].slice(args[i].indexOf("=") + 1);
+      if (raw) {
+        const eq = raw.indexOf("=");
+        const key = eq >= 0 ? raw.slice(0, eq) : raw;
+        const value = eq >= 0 ? raw.slice(eq + 1) : (fromEnv ? "!" : "");
+        if (gitConfigRuns(key, value)) return outwardClassify(`git -c ${key} runs a command git cannot show`);
+      }
+      i += args[i] === "-c" || !args[i].includes("=") ? 2 : 1;
+    } else i++;
   }
   const sub = args[i];
   const rest = args.slice(i + 1);
-  const has = (...flags: string[]) => rest.some((a) => flags.includes(a));
+  const has = (...flags: string[]) => rest.some((a) => flags.some((f) => a === f || longOption(a, f)));
   // A long flag, or its letter alone or in a cluster such as `-SW`.
   const flag = (long: string, letter: string) => has(long) || rest.some((a) => new RegExp(`^-[a-zA-Z]*${letter}[a-zA-Z]*$`).test(a));
   if (!sub) return ALLOW;
@@ -838,17 +1377,90 @@ function git(args: string[], scope: Scope): Verdict {
   // Only --staged alone keeps the working tree; --worktree with it still discards changes.
   if (sub === "restore" && (!flag("--staged", "S") || flag("--worktree", "W"))) return ask("git restore discards local changes");
   // Without --force git refuses to remove a worktree or submodule that has local changes.
-  if (sub === "worktree" && operands(rest)[0] === "remove" && flag("--force", "f")) return ask("git worktree remove --force deletes the worktree with its uncommitted changes");
+  if (sub === "worktree" && operands(rest)[0] === "remove") {
+    // The worktree is deleted with its files, so a target outside the checkout (a sibling of the
+    // project is the usual `../x` and stays allowed) asks like any other outside delete.
+    const target = operands(rest)[1];
+    if (target !== undefined) {
+      const p = resolveWord(target, scope);
+      const sibling = !!p && !!scope.root && path.dirname(scope.root) === path.dirname(p);
+      if (!p || (!isLocal(p, scope) && !sibling)) return outside(`git worktree remove deletes a checkout outside the working directory: ${target}`, p);
+    }
+    if (flag("--force", "f")) return ask("git worktree remove --force deletes the worktree with its uncommitted changes");
+  }
   if (sub === "submodule" && operands(rest)[0] === "deinit" && flag("--force", "f")) return ask("git submodule deinit --force deletes submodule working trees with their local changes");
+  // These run a shell command or a program the guard cannot see, and repeat it.
+  if (sub === "submodule" && operands(rest)[0] === "foreach") return outwardClassify("git submodule foreach runs a shell command in every submodule");
+  if (sub === "rebase" && rest.some((a) => a === "--exec" || /^--exec=/.test(a) || /^-x/.test(a))) return outwardClassify("git rebase --exec runs a shell command after each commit");
+  if (sub === "bisect" && operands(rest)[0] === "run") return outwardClassify("git bisect run executes an arbitrary program repeatedly");
   if (sub === "branch") return has("-D") || (has("-d", "--delete") && has("-f", "--force")) ? ask("git branch -D deletes a branch") : ALLOW;
   if (sub === "stash") return has("drop", "clear") ? ask("git stash drop deletes stashed changes") : ALLOW;
   if (sub === "tag") return has("-d", "--delete") ? ask("git tag -d deletes a tag") : ALLOW;
   if (sub === "reset" || sub === "clean" || sub === "checkout" || sub === "restore") return ALLOW;
+  // A checkout outside the project is a write. A sibling of the project is the usual `../x`
+  // worktree next to the checkout and stays allowed, as it was before.
+  if (sub === "worktree" && operands(rest)[0] === "add") {
+    const target = worktreeAddTarget(rest.slice(1));
+    if (target === undefined) return classify("git worktree add without a readable target");
+    const p = resolveWord(target, scope);
+    if (!p) return classify(`git worktree add to a path the rules cannot resolve: ${target}`);
+    const sibling = !!scope.root && path.dirname(scope.root) === path.dirname(p);
+    if (!isLocal(p, scope) && !sibling) return outside(`git worktree add writes a checkout outside the working directory: ${target}`, p);
+    return ALLOW;
+  }
+  if (sub === "clone") {
+    const target = gitCloneTarget(rest);
+    if (target !== undefined) {
+      const p = resolveWord(target, scope);
+      if (!p || !isLocal(p, scope)) return outside(`git clone writes a checkout outside the working directory: ${target}`, p);
+    }
+    return ALLOW;
+  }
+  if (sub === "format-patch") {
+    const out = optionArg(rest, "-o", "--output-directory");
+    if (out !== undefined) { const v = writePathVerdict("git format-patch", out, scope); if (v) return v; }
+  }
+  if (sub === "archive") {
+    const out = optionArg(rest, "-o", "--output");
+    if (out !== undefined) { const v = writePathVerdict("git archive", out, scope); if (v) return v; }
+  }
+  if (sub === "bundle" && operands(rest)[0] === "create") {
+    const file = operands(rest)[1];
+    if (file !== undefined) { const v = writePathVerdict("git bundle create", file, scope); if (v) return v; }
+  }
+  if (sub === "apply") {
+    if (has("--unsafe-paths")) return ask("git apply --unsafe-paths may write outside the checkout");
+    const dir = optionArg(rest, "--directory");
+    if (dir !== undefined) {
+      const p = resolveWord(dir, scope);
+      if (!p || !isLocal(p, scope)) return outside(`git apply writes under a directory outside the working directory: ${dir}`, p);
+    }
+  }
+  // A mailbox can add lines to a project script; what it changes is not visible to the rules.
+  if (sub === "am") return outwardClassify("git am applies patches the rules cannot read");
+  // log/diff/show write their whole output to --output, outside the project when it names one.
+  if (sub === "log" || sub === "diff" || sub === "show") {
+    const out = optionArg(rest, "--output");
+    if (out !== undefined) { const v = writePathVerdict(`git ${sub}`, out, scope); if (v) return v; }
+  }
   if (sub === "config") {
+    // Hooks and commands git runs later are persistence: they stay with the model even though
+    // the config file is inside the repository.
+    const words = withoutOptionValues(rest, "-f", "--file").filter((a) => !a.startsWith("-"));
+    const [key, value] = words;
+    const changes = rest.some((a) => /^(--unset|--unset-all|--add|--replace-all|--rename-section|--remove-section|--edit|-e)$/.test(a));
+    // --file/-f writes the config to a named file, which may be outside the project.
+    const file = optionArg(rest, "-f", "--file");
+    const setting = changes || value !== undefined;
+    if (file !== undefined && setting) {
+      const v = writePathVerdict("git config", file, scope);
+      if (v) return v;
+    }
+    if (key && setting && gitConfigRuns(key, value)) {
+      return outwardClassify(`git config ${key} changes a command git runs later`);
+    }
     if (has("--global", "--system")) {
       // Reading a key (`git config --global user.name`) changes nothing; setting one names a value.
-      const setting = has("--unset", "--unset-all", "--add", "--replace-all", "--rename-section", "--remove-section", "--edit", "-e")
-        || rest.filter((a) => !a.startsWith("-")).length >= 2;
       return setting ? ask("changes git config outside the repository") : ALLOW;
     }
     return ALLOW;
@@ -863,10 +1475,16 @@ function gh(args: string[]): Verdict {
   const [group, action] = operands(args);
   if (!group) return ALLOW;
   if (group === "api") {
-    const m = args.findIndex((a) => a === "-X" || a === "--method");
-    const method = m >= 0 ? (args[m + 1] ?? "").toUpperCase() : args.find((a) => /^-X\w+$/.test(a))?.slice(2).toUpperCase();
-    const fields = args.some((a) => /^(-f|-F|--field|--raw-field|--input)(=|$)/.test(a));
-    if (method ? method !== "GET" : fields) return ask("gh api call that changes remote data");
+    // -X POST, -XPOST, --method POST and --method=POST all name the HTTP method.
+    let method: string | undefined;
+    for (let i = 0; i < args.length; i++) {
+      const a = args[i];
+      if (/^-X\w+$/.test(a)) method = a.slice(2);
+      else if (a === "-X") method = args[++i];
+      else if (longOption(a, "--method")) method = a.includes("=") ? a.slice(a.indexOf("=") + 1) : args[++i];
+    }
+    const fields = args.some((a) => /^(-f|-F)(=|$)/.test(a) || /^-f./.test(a) || longOption(a, "--field") || longOption(a, "--raw-field") || longOption(a, "--input"));
+    if (method ? method.toUpperCase() !== "GET" : fields) return ask("gh api call that changes remote data");
     return ALLOW;
   }
   if (group === "auth") return action === "status" ? ALLOW : classify("gh auth");
@@ -901,15 +1519,414 @@ function subcommand(tool: string, args: string[]): Verdict {
   return ASK_BY_DEFAULT[tool] ? ask(`${tool} ${sub} ${ASK_BY_DEFAULT[tool]}`) : { ...classify(`${tool} ${sub}`), pattern: `${tool} ${sub} *` };
 }
 
-function network(cmd: string, args: string[], scope: Scope): Verdict {
-  if (cmd === "curl") {
-    if (args.some((a) => /^(-d|--data|--data-\w+|--json|-F|--form|--form-string|-T|--upload-file)(=|$)/.test(a) || /^-[a-zA-Z]*[dFT]/.test(a))) {
-      return ask("curl sends data to a remote host");
+// Orca coordination (spec section 11). The subcommand decides, never a blanket: reads are
+// allowed, coordination that can start or stop another agent's work is judged, and anything
+// that touches another machine or the GUI asks. A PATH assignment, or a program that is not
+// Orca's own executable, means the name cannot be trusted.
+const ORCA_READ: Record<string, string> = {
+  skills: "list get",
+  worktree: "list show current ps",
+  repo: "list show",
+  terminal: "list show",
+  orchestration: `send ask reply check inbox worker_done run-current run-show run-list task-list task-update
+    dispatch-show worker-show worker-read worker-list gate-list request-show`,
+};
+const ORCA_JUDGE: Record<string, string> = {
+  worktree: "create set",
+  repo: "add set",
+  orchestration: `worker-start worker-stop worker-abandon worker-release dispatch task-create run-create reset`,
+};
+const ORCA_ASK = new Set(["computer", "account", "serve"]);
+const ORCA_INSTALL = /(^|\/)orca\/resources\/bin\/orca(\.exe)?$/i;
+const orcaProgram = (program: string) => {
+  if (/^orca(\.exe)?$/i.test(program)) return true;
+  const p = slash(program);
+  // A path into Orca's install, and only an absolute one: `./orca` is any file named orca.
+  return /^(\/|[a-z]:\/)/i.test(p) && ORCA_INSTALL.test(p);
+};
+const orcaPattern = (sub: string | undefined, second: string | undefined) =>
+  sub && /^[a-z][\w-]*$/i.test(sub) ? `orca ${sub}${second && /^[a-z][\w-]*$/i.test(second) ? ` ${second}` : ""} *` : undefined;
+function orca(args: string[], words: string[]): Verdict {
+  // Any command that can reach a remote host asks, whatever its subcommand.
+  if (args.some((a) => /^--(pairing-code|environment)(=|$)/.test(a))) return ask(`orca ${args.find((a) => /^--(pairing-code|environment)(=|$)/.test(a))} reaches a remote host`);
+  if (args.some((a) => /^--on(=|$)/.test(a))) return ask("orca --on reaches another terminal, possibly on a remote host");
+  // A changed PATH can point `orca` at another program.
+  if (words.some((w) => /^PATH=/.test(w))) {
+    const judged = classify("orca with a changed PATH");
+    const pattern = orcaPattern(args[0], args[1]);
+    return pattern ? { ...judged, pattern } : judged;
+  }
+  const [sub = "", second] = args;
+  if (!sub || /^(--help|-h|--version|-v|help)$/i.test(sub)) return ALLOW;
+  if (sub === "status" || sub === "agent-context") return ALLOW;
+  const allow = ORCA_READ[sub];
+  if (allow && allow.split(/\s+/).includes(second ?? "")) return ALLOW;
+  if (ORCA_ASK.has(sub)) return ask(`orca ${sub} ${sub === "serve" ? "opens a server" : "drives the GUI or another account"}`);
+  if (sub === "worktree" && ["rm", "remove", "delete"].includes(second ?? "")) return ask("orca worktree rm removes a worktree");
+  if (ORCA_JUDGE[sub]?.split(/\s+/).includes(second ?? "")) return { ...classify(`orca ${sub} ${second}`), pattern: orcaPattern(sub, second) };
+  return { ...classify(`orca ${sub}${second ? ` ${second}` : ""}`), pattern: orcaPattern(sub, second) };
+}
+
+// A nested agent started with the guard off, or the guard's own mode variables changed. These
+// are locked: no user allow rule and no model can replace them.
+function bypass(name: string, args: string[], assigned: string[], exported: boolean): Verdict | undefined {
+  const option = (...names: string[]) => args.some((a) => names.some((n) => a === n || a.startsWith(`${n}=`)));
+  if (/^pi(\.(exe|cmd|bat))?$/i.test(name)) {
+    if (option("--no-extensions", "-ne")) return guardAsk("pi --no-extensions drops the auto-mode guard");
+    if (option("--extension", "-e")) return guardAsk("pi loads an extension, which can drop the auto-mode guard");
+    if (assigned.some((w) => /^PI_CODING_AGENT_DIR=/.test(w))) return guardAsk("changes PI_CODING_AGENT_DIR, which moves Pi's guard and extensions");
+  }
+  if (/^claude(\.(exe|cmd|bat))?$/i.test(name) && option("--dangerously-skip-permissions")) {
+    return guardAsk("claude --dangerously-skip-permissions turns off its permission checks");
+  }
+  if (/^codex(\.(exe|cmd|bat))?$/i.test(name) && option("--dangerously-bypass-approvals-and-sandbox", "--yolo")) {
+    return guardAsk("codex drops its approval checks");
+  }
+  if (/^opencode(\.(exe|cmd|bat))?$/i.test(name) && option("--dangerously-skip-permissions", "--skip-permissions", "--yolo", "--auto-approve", "--bypass-permissions", "--no-permissions")) {
+    return guardAsk("opencode bypasses its permission checks");
+  }
+  // The child reads these: PI_AUTOMODE_MODE overrides the mode, and an exported
+  // PI_CODING_AGENT_DIR moves the guard itself.
+  if (assigned.some((w) => /^PI_AUTOMODE_MODE=/.test(w))) return guardAsk("sets PI_AUTOMODE_MODE, which overrides the auto-mode guard in a child Pi");
+  if (exported && assigned.some((w) => /^PI_CODING_AGENT_DIR=/.test(w))) {
+    return guardAsk("changes PI_CODING_AGENT_DIR, which moves Pi's guard and extensions");
+  }
+  return undefined;
+}
+
+// cmd.exe /c hides its text from the bash parser. A line that deletes a path the rules cannot
+// prove is a project file of an existing directory stays critical; any other line is judged.
+const CMD_DELETE = /(?:^|[\s&|;(])(del|erase|rmdir|rd|deltree)\b([^&|;]*)/gi;
+function cmdDeletesSystemPath(text: string, scope: Scope): boolean {
+  for (const m of text.matchAll(CMD_DELETE)) {
+    const words = m[2].split(/\s+/).filter((w) => w && !w.startsWith("/") && !w.startsWith("-") && !/^[a-z]+:$/i.test(w));
+    if (!words.length) return true;
+    for (const word of words) {
+      const p = resolveWord(word.replace(/^["']|["']$/g, ""), scope);
+      // A wildcard, an unknown path, a path outside the project and a working directory that
+      // does not exist cannot be proven to stay in the working directory.
+      if (!p || !isLocal(p, scope) || /[*?]/.test(word) || !scope.cwd || !fs.existsSync(scope.cwd)) return true;
     }
-    const m = args.findIndex((a) => a === "-X" || a === "--request");
-    const method = m >= 0 ? args[m + 1] : args.find((a) => /^-X\w+$/.test(a))?.slice(2);
+  }
+  return false;
+}
+
+function cmdLinkVerdict(text: string, scope: Scope): Verdict | undefined {
+  const words = text.split(/\s+/).map((w) => w.replace(/^["']|["']$/g, ""));
+  const at = words.findIndex((w) => /^mklink(\.exe)?$/i.test(w));
+  if (at < 0) return undefined;
+  const rest = words.slice(at + 1).filter((w) => w && !w.startsWith("/"));
+  const target = rest[1];
+  if (!target) return classify("cmd mklink without a readable target");
+  return linkVerdict("mklink", target, scope);
+}
+
+function cmdVerdict(args: string[], scope: Scope): Verdict {
+  const at = args.findIndex((a) => /^\/[ck]$/i.test(a));
+  const text = (at >= 0 ? args.slice(at + 1) : args).join(" ");
+  const link = cmdLinkVerdict(text, scope);
+  if (link) return link;
+  return cmdDeletesSystemPath(text, scope)
+    ? criticalAsk("cmd.exe deletes a path the rules cannot prove is in the working directory")
+    : classify("cmd.exe command");
+}
+
+// ---- PowerShell writes inside the project ----
+
+// The writer cmdlets whose targets this vocabulary can read. Any other writer stays critical.
+const PS_LOCAL_WRITERS = new Set(["set-content", "add-content", "new-item", "out-file", "copy-item", "move-item", "remove-item", "rename-item", "tee-object"]);
+const PS_PATH_FLAGS = new Set(["-path", "-literalpath", "-filepath", "-pspath"]);
+// Flags whose next word is not a path.
+const PS_VALUE_FLAGS = new Set(["-value", "-encoding", "-itemtype", "-filter", "-include", "-exclude", "-credential", "-stream", "-delimiter", "-width", "-inputobject", "-newname", "-language", "-replace", "-type", "-variable"]);
+
+// Words of one PowerShell command, with the quotes removed.
+function psWords(text: string): string[] {
+  const out: string[] = [];
+  let word = "";
+  let quote: string | undefined;
+  let has = false;
+  for (const c of text) {
+    if (quote) {
+      if (c === quote) quote = undefined;
+      else word += c;
+    } else if (c === "'" || c === '"') {
+      quote = c;
+      has = true;
+    } else if (/\s/.test(c)) {
+      if (has) out.push(word);
+      word = "";
+      has = false;
+    } else {
+      word += c;
+      has = true;
+    }
+  }
+  if (has) out.push(word);
+  return out;
+}
+
+// Words for the writer parser: quotes removed, while a parenthesised expression stays together.
+function psWriteWords(text: string): string[] {
+  return psExprWords(text).map((word) => {
+    const eq = word.indexOf("=");
+    if (word.startsWith("-") && eq > 1) {
+      const value = word.slice(eq + 1);
+      return word.slice(0, eq + 1) + (psUnquote(value) ?? value);
+    }
+    if (word.startsWith("-")) return word;
+    return psUnquote(word) ?? word;
+  });
+}
+
+// Command positions of a PowerShell line, split on newlines, `;` and `|` outside quotes.
+function psSegments(text: string): string[] {
+  const out: string[] = [];
+  let cur = "";
+  let quote: string | undefined;
+  for (const c of text) {
+    if (quote) {
+      cur += c;
+      if (c === quote) quote = undefined;
+    } else if (c === "'" || c === '"') {
+      quote = c;
+      cur += c;
+    } else if (c === "\n" || c === ";" || c === "|" || c === "{" || c === "}") {
+      out.push(cur);
+      cur = "";
+    } else cur += c;
+  }
+  out.push(cur);
+  return out;
+}
+
+// The write targets of one local-writer cmdlet. `undefined` means the targets cannot be read.
+function psTargets(canonical: string, words: string[]): { paths: string[]; recurse: boolean; link?: { type: string; targets: string[] } } | undefined {
+  const paths: string[] = [];
+  const destinations: string[] = [];
+  const positionals: string[] = [];
+  let newName: string | undefined;
+  let itemType: string | undefined;
+  let linkTarget: string | undefined;
+  let linkValue: string | undefined;
+  let recurse = false;
+  for (let i = 1; i < words.length; i++) {
+    const word = words[i];
+    const eq = word.indexOf("=");
+    if (word.startsWith("-") && eq > 1) {
+      const flag = word.slice(0, eq).toLowerCase();
+      if (flag === "-destination") destinations.push(word.slice(eq + 1));
+      else if (flag === "-newname") newName = word.slice(eq + 1);
+      else if (flag === "-itemtype" || flag === "-type") itemType = word.slice(eq + 1);
+      else if (flag === "-target") linkTarget = word.slice(eq + 1);
+      else if (flag === "-value") linkValue = word.slice(eq + 1);
+      else if (PS_PATH_FLAGS.has(flag)) paths.push(word.slice(eq + 1));
+      continue;
+    }
+    if (/^-[a-z][\w-]*$/i.test(word)) {
+      const flag = word.toLowerCase();
+      if (flag === "-recurse" || flag === "-r") recurse = true;
+      if (flag === "-destination") {
+        const value = words[++i];
+        if (value !== undefined) destinations.push(value);
+      } else if (flag === "-newname") {
+        newName = words[++i];
+      } else if (flag === "-itemtype" || flag === "-type") {
+        itemType = words[++i];
+      } else if (flag === "-target") {
+        linkTarget = words[++i];
+      } else if (flag === "-value") {
+        linkValue = words[++i];
+      } else if (PS_PATH_FLAGS.has(flag)) {
+        const value = words[++i];
+        if (value !== undefined) paths.push(value);
+      } else if (PS_VALUE_FLAGS.has(flag)) i++;
+      continue;
+    }
+    positionals.push(word);
+  }
+  const all = [...paths, ...destinations, ...positionals];
+  const linkType = itemType?.toLowerCase();
+  const isLink = !!linkType && ["symboliclink", "junction", "hardlink"].includes(linkType);
+  const link = isLink ? { type: linkType!, targets: [linkTarget, linkValue].filter((x): x is string => !!x) } : undefined;
+  switch (canonical) {
+    case "set-content":
+    case "add-content":
+    case "out-file":
+    case "tee-object":
+      return { paths: all.slice(0, 1), recurse };
+    case "rename-item": {
+      // -NewName is a path relative to the item's folder and may climb out of it.
+      const source = all[0];
+      if (!source) return { paths: [], recurse };
+      return { paths: newName ? [source, path.join(path.dirname(source), newName)] : [source], recurse };
+    }
+    case "new-item": {
+      // -Name is created under -Path, and may contain `..`.
+      const base = paths[0];
+      const name = positionals[0];
+      return { paths: base && name ? [path.join(base, name)] : base ? [base] : name ? [name] : [], recurse, link };
+    }
+    case "copy-item":
+      // Only the destination is written; the source is read. A pipeline source has no target.
+      return { paths: [destinations[0] ?? positionals[1] ?? (paths.length > 1 ? paths[1] : undefined)].filter(Boolean) as string[], recurse };
+    default:
+      // remove-item and move-item change every path operand they are given.
+      return { paths: all, recurse };
+  }
+}
+
+interface PsWrites {
+  found: boolean;
+  ok: boolean;
+  verdict?: Verdict;
+  // The local writers that were written as an alias (sc, rm, ni…), with how many of them the
+  // segment parse read. The alias scan in powershellVerdict only skips that many.
+  aliases?: Map<string, number>;
+}
+
+// Whether the file writes of a PowerShell line all have literal targets inside the working
+// directory or temp. Without a scope nothing can be proven, so the old critical ask stays.
+function psWrites(text: string, bare: string, scope: Scope | undefined): PsWrites {
+  const vars = psAssignments(text);
+  const writers = [...bare.matchAll(new RegExp(PS_WRITERS.source, "gi"))]
+    .map((m) => /([a-z][a-z0-9]*-[a-z0-9]+)$/i.exec(m[0].trim())?.[1].toLowerCase() ?? "");
+  // Out-File and Tee-Object do not match PS_WRITERS, which wants `<verb>-<noun>` twice.
+  const outFile = /\b(out-file|tee-object)\b/i.test(bare);
+
+  interface Target { word: string; recurse: boolean }
+  const targets: Target[] = [];
+  const parsedNames: string[] = [];
+  const aliases = new Map<string, number>();
+  const fail = (verdict = criticalAsk("PowerShell writes a file")): PsWrites => ({ found: true, ok: false, verdict });
+  for (const segment of psSegments(text)) {
+    const words = psWriteWords(segment);
+    if (!words.length) continue;
+    if (words[0].startsWith("$") && words[1] === "=") continue;
+    // Redirects can follow any command position.
+    for (let i = 0; i < words.length; i++) {
+      const match = /^(?:\d+|\*)?(>>?)(.*)$/.exec(words[i]);
+      if (!match) continue;
+      const rest = match[2];
+      const target = rest.startsWith("&") ? "" : rest || (words[++i] ?? "");
+      // $null and a file descriptor duplicate are not files.
+      if (!target || target === "$null" || /^\d+$/.test(target)) continue;
+      targets.push({ word: target, recurse: false });
+    }
+    const raw = words[0].toLowerCase();
+    const canonical = PS_ALIASES[raw] ?? raw;
+    if (!PS_LOCAL_WRITERS.has(canonical)) continue;
+    if (PS_ALIASES[raw]) aliases.set(canonical, (aliases.get(canonical) ?? 0) + 1);
+    parsedNames.push(canonical);
+    const extracted = psTargets(canonical, words);
+    if (!extracted || !extracted.paths.length) return { found: true, ok: false, verdict: criticalAsk("PowerShell writes a file") };
+    // A symbolic link, junction or hard link makes a later project-looking path reach its target.
+    if (extracted.link) {
+      if (!extracted.link.targets.length) return fail(criticalAsk("PowerShell creates a link to an unknown target"));
+      for (const target of extracted.link.targets) {
+        const v = psLinkVerdict(target, scope, vars);
+        if (v) return fail(v);
+      }
+    }
+    // Copy-Item and Move-Item read their source as well as writing the destination.
+    if (canonical === "copy-item" || canonical === "move-item") {
+      for (const source of psCopySources(words)) {
+        const v = psCopySourceVerdict(source, scope, vars);
+        if (v) return fail(v);
+      }
+    }
+    for (const word of extracted.paths) targets.push({ word, recurse: extracted.recurse });
+  }
+  if (!writers.length && !outFile && !targets.length && !parsedNames.length) return { found: false, ok: true };
+  if (!scope) return fail();
+  // Cmdlets that change something other than a file (Stop-Process, Invoke-RestMethod, Start-Job) are
+  // not credential reads or root: they are judged like any outward action, not gated.
+  const other = writers.find((w) => !PS_LOCAL_WRITERS.has(w));
+  if (other) return fail(ask(`PowerShell runs ${other}`));
+
+  // Every writer the vocabulary sees must have been read here. An alias (sc, rm) adds a parsed
+  // name the regex does not see, which is fine; a writer the regex sees but the segment parse
+  // missed (inside parentheses, say) is not.
+  const unread = [...writers];
+  for (const name of parsedNames) {
+    const at = unread.indexOf(name);
+    if (at >= 0) unread.splice(at, 1);
+  }
+  if (unread.length || !targets.length) return fail();
+
+  let bad: Verdict | undefined;
+  for (const { word, recurse } of targets) {
+    // A variable, wildcard or subexpression cannot be resolved here.
+    if (!word || /[$`*?[\]{}()]/.test(word)) return fail();
+    const p = resolveWord(word, scope);
+    if (!p) return fail();
+    // The write must land in the project (or temp), and the working directory must exist: that is
+    // what proves a literal target really is inside it (a synthetic or removed cwd proves nothing).
+    if (isGuarded(p, scope)) return fail(criticalAsk("PowerShell changes the auto-mode guard's own files"));
+    if (isPiFile(p, scope)) return fail(criticalAsk(`PowerShell changes Pi's own files: ${word}`));
+    if (!isLocal(p, scope) || !scope.cwd || !fs.existsSync(scope.cwd)) return fail();
+    if (recurse && scope.root && (p === scope.root || /(^|[\\/])\.git([\\/]|$)/i.test(p))) {
+      bad ??= ask("PowerShell removes the whole project or its git data");
+    }
+  }
+  if (bad) return { found: true, ok: false, verdict: bad };
+  return { found: true, ok: true, aliases };
+}
+
+// A header value that looks like a token rather than a media type or a short setting.
+function tokenLooking(value: string): boolean {
+  const after = value.includes(":") ? value.slice(value.indexOf(":") + 1) : value;
+  for (const m of after.matchAll(/[A-Za-z0-9_\-]{12,}/g)) {
+    const token = m[0];
+    if (token.length >= 20 || (token.length >= 12 && /[A-Z_0-9]/.test(token))) return true;
+  }
+  return false;
+}
+
+function headerValues(args: string[]): string[] {
+  const out: string[] = [];
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (a === "-H") { if (args[i + 1] !== undefined) out.push(args[++i]); }
+    else if (longOption(a, "--header")) {
+      if (a.includes("=")) out.push(a.slice(a.indexOf("=") + 1));
+      else if (args[i + 1] !== undefined) out.push(args[++i]);
+    } else if (/^-H./.test(a)) out.push(a.slice(2));
+  }
+  return out;
+}
+
+const URL_TOKEN = /[?&](token|key|secret|password|passwd|api_key|apikey)=/i;
+function tokenQuery(args: string[]): string | undefined {
+  return args.find((a) => /^https?:\/\//i.test(a) && URL_TOKEN.test(a));
+}
+
+function network(cmd: string, args: string[], scope: Scope): Verdict {
+  const sends = `${cmd} sends data to a remote host`;
+  if (cmd === "curl") {
+    if (args.some((a) => a === "-K" || a.startsWith("-K") || longOption(a, "--config"))) return ask(sends);
+    for (const header of headerValues(args)) if (header.startsWith("@") || tokenLooking(header)) return ask(sends);
+    const cookie = optionArg(args, "-b", "--cookie");
+    if (cookie?.startsWith("@")) return ask(sends);
+  } else {
+    if (args.some((a) => longOption(a, "--config") || a === "-K")) return ask(sends);
+    for (const header of headerValues(args)) if (header.startsWith("@") || tokenLooking(header)) return ask(sends);
+    if (args.some((a) => longOption(a, "--load-cookies"))) return ask(sends);
+  }
+  if (tokenQuery(args)) return ask(sends);
+  if (cmd === "curl") {
+    // -d/--data, --json, -F/--form and -T/--upload-file send a body; GNU accepts the prefixes.
+    const sendsData = args.some((a) => /^(-d|-F|-T)(=|$)/.test(a) || /^-[a-zA-Z]*[dFT]/.test(a)
+      || ["--data", "--data-raw", "--data-binary", "--data-urlencode", "--json", "--form", "--form-string", "--upload-file"].some((f) => longOption(a, f)));
+    if (sendsData) return ask("curl sends data to a remote host");
+    let method: string | undefined;
+    for (let i = 0; i < args.length; i++) {
+      const a = args[i];
+      if (/^-X\w+$/.test(a)) method = a.slice(2);
+      else if (a === "-X") method = args[++i];
+      else if (longOption(a, "--request")) method = a.includes("=") ? a.slice(a.indexOf("=") + 1) : args[++i];
+    }
     if (method && !/^(GET|HEAD|OPTIONS)$/i.test(method)) return ask(`curl -X ${method} changes remote data`);
-  } else if (args.some((a) => /^--(post|body|method)/.test(a))) {
+  } else if (args.some((a) => longOption(a, "--post-data") || longOption(a, "--post-file") || longOption(a, "--body-data") || longOption(a, "--body-file") || longOption(a, "--method"))) {
     return ask("wget sends data to a remote host");
   }
   const curl = cmd === "curl";
@@ -917,9 +1934,10 @@ function network(cmd: string, args: string[], scope: Scope): Verdict {
   // of the file it saves to stays local.
   const outFlags = curl ? ["-o", "--output"] : ["-O", "--output-document", "-o", "--output-file"];
   const literal = (a: string) => a.replace(/\$\{(\w+)\}|\$(\w+)/g, (m, x, y) => (scope.loopVars?.has(x ?? y) ? "" : m));
-  if (args.some((a, i) => /[$`]/.test(literal(a)) && !outFlags.includes(args[i - 1]))) return ask(`${cmd} request built from local data`);
+  const isOut = (flag: string) => outFlags.some((f) => flag === f || (f.startsWith("--") && longOption(flag, f)));
+  if (args.some((a, i) => /[$`]/.test(literal(a)) && !isOut(args[i - 1] ?? ""))) return ask(`${cmd} request built from local data`);
   const opts = optionValues(args, curl ? "AbcCdDeEFHKmoPQrtTuUwxXyYz" : "aABDeiIlOoPQRtTUwX", [...DOWNLOAD_FILES[cmd].other, ...DOWNLOAD_FILES[cmd].saved, DOWNLOAD_FILES[cmd].dir].flat());
-  const values = (flags: string[]) => opts.filter(([flag]) => flags.includes(flag)).map(([, value]) => value ?? "");
+  const values = (flags: string[]) => opts.filter(([flag]) => flags.some((f) => flag === f || (f.startsWith("--") && longOption(flag, f)))).map(([, value]) => value ?? "");
   const writes = (file: string) => {
     const p = resolveWord(file, scope);
     if (file === "-" || (p && DEV_SINKS.test(p))) return { p: undefined };
@@ -968,7 +1986,7 @@ function optionValues(args: string[], valued: string, long: string[]): [string, 
     if (a === "--") break;
     if (a.startsWith("--")) {
       const eq = a.indexOf("=");
-      out.push(eq > 0 ? [a.slice(0, eq), a.slice(eq + 1)] : [a, long.includes(a) ? args[++i] : undefined]);
+      out.push(eq > 0 ? [a.slice(0, eq), a.slice(eq + 1)] : [a, long.some((l) => l === a || longOption(a, l)) ? args[++i] : undefined]);
     } else if (a.length > 1 && a.startsWith("-")) {
       for (let j = 1; j < a.length; j++) {
         if (!valued.includes(a[j])) {
@@ -1006,13 +2024,115 @@ function find(args: string[], scope: Scope): Verdict {
   for (const r of roots.length ? roots : ["."]) {
     const p = resolveWord(r, scope);
     if (isPiFile(p, scope)) return piAsk(`find deletes or runs commands in Pi's own files: ${r}`);
-    if (!isLocal(p, scope)) return outside(`find deletes or runs commands outside the working directory: ${r}`, p);
+    if (!isLocal(p, scope)) return outsideDelete(`find deletes or runs commands outside the working directory: ${r}`, p);
   }
   if (exec < 0) return classify("find -delete");
   return worst(classify("find -exec"), simple({ argv: inner!, out: [] }, scope, 1));
 }
 
-// Drops leading keywords, VAR=value assignments and wrappers such as `timeout 60` or `env`.
+// sed `w`/`W` commands write files named inside the script; `e` and the `e` flag on s/// run a
+// shell command. `-f` names a script file, `-e`/`--expression` supply a script on the line.
+const SED_WRITE = /(?:^|[;\n{}])\s*[wW]\s+(\S+)|(?:^|[^\\])\/[wW]\s+(\S+)/g;
+const SED_BARE_WRITE = /(?:^|[;\n{}])\s*[wW]\s*(?=$|[;\n}])/;
+const SED_EXEC_COMMAND = /(?:^|[;\n{}])\s*e(?:\s|$)/;
+function sedScriptWrites(script: string): string[] {
+  const out: string[] = [];
+  for (const m of script.matchAll(SED_WRITE)) out.push(m[1] ?? m[2]);
+  return out;
+}
+// The `e` flag on a substitution, as in `s|a|b|e`, and the `e` command on its own.
+function sedScriptExecs(script: string): boolean {
+  if (SED_EXEC_COMMAND.test(script)) return true;
+  for (const m of script.matchAll(/(?:^|[;\n{}])\s*s(.)/g)) {
+    const delimiter = m[1];
+    const rest = script.slice((m.index || 0) + m[0].length);
+    let part = 0;
+    for (let i = 0; i < rest.length; i++) {
+      if (rest[i] === "\\") { i++; continue; }
+      if (rest[i] !== delimiter) continue;
+      if (++part !== 2) continue;
+      const flags = /^[a-zA-Z0-9]*/.exec(rest.slice(i + 1))?.[0] ?? "";
+      if (flags.includes("e")) return true;
+      break;
+    }
+  }
+  return false;
+}
+
+function sedVerdict(args: string[], scope: Scope): Verdict {
+  if (sedWrites(args)) return writeTargets("sed", args, scope);
+  let verdict: Verdict = ALLOW;
+  const scripts: string[] = [];
+  const scriptFiles = optionArgs(args, "-f", "--file");
+  // -e/--expression may be repeated; the first operand is the script only when neither is given.
+  const expressions = optionArgs(args, "-e", "--expression");
+  if (expressions.length) scripts.push(...expressions);
+  else if (!scriptFiles.length) {
+    const first = operands(withoutOptionValues(args, "-f", "--file"))[0];
+    if (first !== undefined) scripts.push(first);
+  }
+  for (const file of scriptFiles) {
+    const p = resolveWord(file, scope);
+    if (p && !isLocal(p, scope)) return outwardClassify(`sed runs a script from outside the working directory: ${file}`);
+    // A script file of the project is still a script: read what it names.
+    try {
+      if (p && fs.statSync(p, { throwIfNoEntry: false })?.isFile()) scripts.push(fs.readFileSync(p, "utf8"));
+    } catch { /* unreadable stays with the normal checks */ }
+  }
+  for (const script of scripts) {
+    if (sedScriptExecs(script)) verdict = worst(verdict, outwardClassify("sed runs a shell command from its script"));
+    for (const target of sedScriptWrites(script)) {
+      const v = writePathVerdict("sed", target, scope);
+      if (v) verdict = worst(verdict, v);
+    }
+    // A `w` command with no visible file name can write anywhere the shell can.
+    if (SED_BARE_WRITE.test(script) && !sedScriptWrites(script).length) verdict = worst(verdict, outwardClassify("sed writes a file whose name the rules cannot see"));
+  }
+  return verdict;
+}
+
+// awk writes with `>`/`>>` and runs commands with `| "cmd"` or system(). A target held in an awk
+// variable cannot be resolved here, so it stays with the model instead of being allowed.
+function awkVerdict(args: string[], scope: Scope): Verdict {
+  let program = "";
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (a === "-v" || a === "-F" || a === "-f" || a === "--assign" || a === "--field-separator" || a === "--file") { i++; continue; }
+    if (/^-(v|F|f)/.test(a) || a.startsWith("--")) continue;
+    program = a;
+    break;
+  }
+  if (/system\s*\(/.test(program) || /\|\s*"/.test(program)) return outwardClassify("awk that runs commands");
+  for (const m of program.matchAll(/(>>?|\|)\s*([^\s;|})]+)/g)) {
+    const op = m[1];
+    const raw = m[2];
+    if (op === "|") return outwardClassify("awk that runs commands");
+    if (!raw || raw.startsWith("&") || /^\d+$/.test(raw)) continue;
+    const literal = /^(['"]).*\1$/.test(raw) ? raw.slice(1, -1) : undefined;
+    if (literal === undefined) return outwardClassify("awk writes a file whose name is held in a variable");
+    const v = writePathVerdict("awk", literal, scope);
+    if (v) return v;
+  }
+  return ALLOW;
+}
+
+// dig, nslookup, host, getent, ping, traceroute and whois send the name they query. A token
+// encoded in the name leaves the machine even though the command only reads.
+const DNS_QUERY = new Set(["dig", "nslookup", "host", "getent", "ping", "traceroute", "tracert", "whois"]);
+function dnsEncoded(args: string[]): string | undefined {
+  for (const word of args) {
+    if (word.startsWith("-") || word.startsWith("+") || !/[A-Za-z]/.test(word)) continue;
+    const name = word.replace(/^["']|["']$/g, "").replace(/^\[|\]$/g, "");
+    if (!/^[A-Za-z0-9_.-]+$/.test(name)) continue;
+    if (name.includes("_")) return word;
+    for (const label of name.split(".")) {
+      if (label.length > 24) return word;
+      if (label.length > 8 && /[A-Z]/.test(label)) return word;
+    }
+  }
+  return undefined;
+}
+
 // Empty when nothing is left to run. With `only`, drops just the keywords and those wrappers
 // (by exact name) and stops at an assignment.
 function unwrap(words: string[], only?: Set<string>): string[] {
@@ -1051,6 +2171,7 @@ function redirects(cmd: Simple, scope: Scope): Verdict {
     if (p && /^\/dev\//.test(p)) return deny(`writes to the device ${target}`);
     if (isGuarded(p, scope)) verdict = worst(verdict, guardAsk("redirect overwrites the auto-mode guard's own files"));
     else if (isPiFile(p, scope)) verdict = worst(verdict, piAsk(`redirect writes Pi's own files: ${target}`));
+    else if (isGitHook(p)) verdict = worst(verdict, gitHookWrite(target));
     else if (!isLocal(p, scope)) verdict = worst(verdict, outside(`redirect writes outside the working directory: ${target}`, p));
     // Appending literal text leaves the file's origin as it was.
     if (!(origin === "authored" && cmd.append?.includes(target))) note(p, origin, scope);
@@ -1076,13 +2197,14 @@ function simple(cmd: Simple, scope: Scope, depth = 0): Verdict {
   return worst(out, builtin);
 }
 
+const clip80 = (text: string) => (text.length > 80 ? `${text.slice(0, 80)}...` : text);
 function command(cmd: Simple, scope: Scope, depth: number): Verdict {
   let verdict = ALLOW;
   const argv = unwrap(cmd.argv);
   const assigned = cmd.argv.slice(0, cmd.argv.length - argv.length);
   if (["export", "declare", "typeset", "readonly"].includes(argv[0])) assigned.push(...argv.slice(1));
-  const loader = assigned.map((w) => LOADS_CODE.exec(w)).find((m) => m && (m[1] !== "NODE_OPTIONS" || NODE_LOADS.test(m[2])));
-  if (loader) verdict = classify(`sets ${loader[1]}, which loads other code into the program`);
+  const loader = assigned.map((w) => envLoadsCode(w, scope)).find(Boolean);
+  if (loader) verdict = outwardClassify(loader);
   // `env` or `printenv` on their own print every variable, and tokens often live there.
   const bareEnv = cmd.argv.length && path.basename(cmd.argv[0]) === "env" && cmd.argv.slice(1).every((w) => w.startsWith("-") || /^[A-Za-z_][A-Za-z0-9_]*=/.test(w));
   if (bareEnv || (path.basename(argv[0] ?? "") === "printenv" && argv.length === 1)) return worst(verdict, classify("prints environment variables, which can hold tokens"));
@@ -1090,15 +2212,41 @@ function command(cmd: Simple, scope: Scope, depth: number): Verdict {
 
   const name = path.basename(argv[0]);
   const args = argv.slice(1);
+  const config = configVerdict(name, args, scope);
+  if (config) verdict = worst(verdict, config);
+  // `assigned` holds the assignments and wrapper words unwrap() removed, plus export's arguments.
+  // A word that is merely an argument to a command is not an assignment.
+  const exported = ["export", "declare", "typeset", "readonly"].includes(name);
+  // Orca's own coordination CLI: the subcommand decides, not the name. A path is trusted only
+  // when it is Orca's install, not a temp file or something this session wrote.
+  if (orcaProgram(argv[0])) {
+    const resolved = resolveWord(argv[0], scope);
+    if (!/[\\/]/.test(argv[0]) || (resolved && !inTmp(resolved) && originOf(resolved, scope) === undefined)) return worst(verdict, orca(args, assigned));
+  }
+  // A nested agent started with the guard off, and the guard's mode variables.
+  const off = bypass(name, args, assigned, exported);
+  if (off) return worst(verdict, off);
+  // Printing the environment, or a variable that holds a token, shows the agent a credential.
+  if (printsSecrets(name, args)) verdict = worst(verdict, classify("prints environment variables, which can hold tokens"));
 
   // Bash's parser cannot determine the semantics of another shell's inline code.
   if (/^(powershell|pwsh)(\.exe)?$/i.test(name)) {
     // -Command carries the text, so the vocabulary can read it; -File and -EncodedCommand hide it.
     const at = args.findIndex((a) => /^-(command|c)$/i.test(a));
     if (at >= 0 && args[at + 1]) return powershellVerdict(args.slice(at + 1).join(" "), scope);
+    // -ExecutionPolicy Bypass drops a Windows protection, so it keeps the critical ask.
+    const bypassPolicy = args.some((a, i) => /^-e(xecutionpolicy)?$/i.test(a) && /^(bypass|unrestricted)$/i.test(args[i + 1] ?? ""));
+    const file = args.findIndex((a) => /^-(file|f)$/i.test(a));
+    if (!bypassPolicy) {
+      const script = file >= 0 ? args[file + 1] : args.find((a) => !a.startsWith("-"));
+      if (script && /(\.ps1|\.psm1)$/i.test(script)) {
+        const p = resolveWord(script, scope);
+        if (p) return { ...classify(`runs a PowerShell script: ${script}`), runs: [p] };
+      }
+    }
     return criticalAsk("PowerShell needs review; the command is hidden from the rules");
   }
-  if (/^cmd(\.exe)?$/i.test(name)) return criticalAsk("cmd.exe needs review; the rules cannot see what it runs");
+  if (/^cmd(\.exe)?$/i.test(name)) return worst(verdict, cmdVerdict(args, scope));
 
   if (["case", "function", "select", "source", ".", "trap", "alias"].includes(name)) return worst(verdict, classify(`shell ${name}`));
   if (/^mkfs(\.|$)/.test(name) || name === "wipefs") return deny(`${name} formats a disk`);
@@ -1113,6 +2261,12 @@ function command(cmd: Simple, scope: Scope, depth: number): Verdict {
   }
   const secret = credentialRead(name, args, cmd, scope);
   if (secret) verdict = worst(verdict, criticalAsk(`${name} reads a credential file: ${secret}`));
+  // With an unknown working directory, a bare credential-shaped name cannot be proven to be a
+  // project file, so the read goes to the judges instead of being allowed.
+  if (!secret && !scope.cwd && !NAMES_ONLY.has(name) && !(name === "sed" && sedWrites(args))) {
+    const bare = args.find((a) => !a.includes("=") && CREDENTIAL_BARE_NAMES.has(path.basename(a.replace(/^@/, "")).toLowerCase()));
+    if (bare) verdict = worst(verdict, classify(`reads ${bare} with an unknown working directory, where it could be a credential`));
+  }
   // Pi's package commands change its settings and what code every session loads.
   if (name === "pi" && ["install", "remove", "uninstall", "update", "config"].includes(args[0])) verdict = worst(verdict, piAsk(`pi ${args[0]} changes Pi's own setup`));
   // A program in a temp directory, or one this session wrote or downloaded, is not the tool its
@@ -1145,9 +2299,65 @@ function command(cmd: Simple, scope: Scope, depth: number): Verdict {
   if (name === "rsync" && operands(args).some((a) => /^[\w.@-]+:/.test(a))) return worst(verdict, ask("rsync copies to or from a remote host"));
   if (name === "xargs") {
     const inner = afterFlags(args, /^-[InPLsdE]$/);
-    return worst(verdict, classify("xargs"), inner.length ? simple({ argv: [...inner, "$()"], out: [] }, scope, depth + 1) : ALLOW);
+    // `... | xargs rm -rf`: the targets come from stdin, so the rules cannot see them at all.
+    const destructive = inner.length > 0 && DESTRUCTIVE_XARGS.has(path.basename(inner[0]));
+    return worst(verdict, destructive ? criticalAsk("xargs deletes paths the rules cannot see") : classify("xargs"), inner.length ? simple({ argv: [...inner, "$()"], out: [] }, scope, depth + 1) : ALLOW);
   }
   if (name === "cd" || name === "pushd" || name === "popd") return verdict;
+
+  // Commands whose write target or whose executable lives in a flag.
+  if (name === "sort") {
+    const out = optionArg(args, "-o", "--output");
+    if (out !== undefined) { const v = writePathVerdict("sort", out, scope); if (v) return worst(verdict, v); }
+    return verdict;
+  }
+  if (name === "yq" && args.some((a) => /^(-i|--in-place)(=|$)/.test(a))) {
+    for (const t of operands(args).slice(1)) { const v = writePathVerdict("yq", t, scope); if (v) return worst(verdict, v); }
+    return verdict;
+  }
+  if (name === "xxd" && args.some((a) => /^-r/.test(a))) {
+    const files = args.filter((a) => !a.startsWith("-") || a === "-");
+    const out = files.length >= 2 ? files.at(-1) : undefined;
+    if (out && out !== "-") { const v = writePathVerdict("xxd", out, scope); if (v) return worst(verdict, v); }
+    return verdict;
+  }
+  if (name === "tsc") {
+    for (const flag of ["--outFile", "--outDir", "--declarationDir"]) {
+      const out = optionArg(args, flag);
+      if (out !== undefined) { const v = writePathVerdict(`tsc ${flag}`, out, scope); if (v) return worst(verdict, v); }
+    }
+  }
+  if (FORMATTERS[name]) {
+    const v = formatterVerdict(name, args, scope);
+    if (v) return worst(verdict, v);
+  }
+  if (name === "man" && args.some((a) => a === "-P" || /^--pager(=|$)/.test(a))) return worst(verdict, outwardClassify("man -P runs a pager command the rules cannot see"));
+  if (name === "rg" && args.some((a) => a === "--pre" || /^--pre=/.test(a))) return worst(verdict, outwardClassify("rg --pre runs a command for each searched file"));
+  if (name === "less" && assigned.some((a) => /^LESSOPEN=/.test(a))) return worst(verdict, outwardClassify("less runs the LESSOPEN command it is given"));
+  if (name === "journalctl" && args.some((a) => /^--(vacuum|rotate|flush)/.test(a))) return worst(verdict, ask("journalctl deletes, rotates or flushes journal files"));
+  if (name === "date") {
+    if (args.some((a) => a === "-s" || a === "--set" || /^--set=/.test(a))) return worst(verdict, ask("date --set changes the system clock"));
+    const values = new Set(["-d", "--date", "-r", "--reference", "-f", "--file"]);
+    for (let j = 0; j < args.length; j++) {
+      const a = args[j];
+      if (values.has(a)) { j++; continue; }
+      if (a.startsWith("+") || a.startsWith("-")) continue;
+      return worst(verdict, ask("date with a time operand changes the system clock"));
+    }
+  }
+  if (name === "hostname") {
+    if (args.some((a) => /^(--set|-F|--file|-b|--boot)(=|$)/.test(a))) return worst(verdict, ask("hostname changes the machine name"));
+    if (args.some((a) => !a.startsWith("-"))) return worst(verdict, ask("hostname with an operand changes the machine name"));
+  }
+  if (name === "dmesg" && args.some((a) => a === "-c" || a === "-C" || a === "--clear" || a === "--read-clear" || /^-[a-zA-Z]*c/.test(a))) return worst(verdict, ask("dmesg clears the kernel log"));
+  if (name === "ps") {
+    const env = args.some((a) => (a.startsWith("-") ? /^-[a-zA-Z]*w[a-zA-Z]*$/.test(a) && /e/.test(a) : /e/.test(a)));
+    if (env) return worst(verdict, classify("prints environment variables, which can hold tokens"));
+  }
+  if (DNS_QUERY.has(name)) {
+    const bad = dnsEncoded(args);
+    if (bad) return worst(verdict, outwardClassify(`may encode data in a DNS name: ${bad}`));
+  }
 
   if (name === "rm") return worst(verdict, rm(args, scope));
   if (name === "dd") {
@@ -1164,12 +2374,21 @@ function command(cmd: Simple, scope: Scope, depth: number): Verdict {
       if (p && isRootLike(p)) return deny(`${name} -R on ${t} would change a home or system directory`);
     }
   }
-  if (name === "sed") return worst(verdict, sedWrites(args) ? writeTargets("sed", args, scope) : ALLOW);
-  if (name === "awk" || name === "gawk") return worst(verdict, args.some((a) => /system\s*\(|\|\s*"|>\s*"/.test(a)) ? classify("awk that runs commands or writes files") : ALLOW);
+  if (name === "sed") return worst(verdict, sedVerdict(args, scope));
+  if (name === "awk" || name === "gawk") return worst(verdict, awkVerdict(args, scope));
   if (WRITERS[name]) return worst(verdict, writeTargets(name, args, scope, !!cmd.heredoc && !cmd.expands));
   if (name === "tar" || name === "zip" || name === "unzip" || name === "gzip" || name === "gunzip" || name === "xz" || name === "zstd") {
-    // Archives read and write paths given as operands and after -f / -C / -d.
-    for (const a of args.filter((x) => !x.startsWith("-"))) {
+    if (name === "tar" && args.some((a) => /^(--to-command|--checkpoint-action|--use-compress-program|--info-script|--new-volume-script)(=|$)/.test(a) || a === "-I" || /^-I./.test(a))) {
+      return worst(verdict, outwardClassify("tar runs a command the rules cannot see"));
+    }
+    // Archives read and write paths given as operands and after -f / -C / -d. A change-directory or
+    // destination flag writes where it names, even when that path is attached (-C/dir, -d/dir).
+    const destDirs = name === "tar" ? optionArgs(args, "-C", "--directory") : name === "unzip" ? optionArgs(args, "-d") : [];
+    for (const dir of destDirs) {
+      const v = writePathVerdict(`${name} -${name === "tar" ? "C" : "d"}`, dir, scope);
+      if (v && v.action !== "allow") return worst(verdict, v);
+    }
+    for (const a of withoutOptionValues(args, ...(name === "tar" ? ["-C", "--directory"] : name === "unzip" ? ["-d"] : [])).filter((x) => !x.startsWith("-"))) {
       if (!isLocal(resolveWord(a, scope), scope)) return worst(verdict, classify(`${name} with a path outside the working directory`));
     }
     return verdict;
@@ -1194,9 +2413,46 @@ function command(cmd: Simple, scope: Scope, depth: number): Verdict {
       return worst(verdict, DOCKER_GROUPS[group].split(" ").includes(action) ? ALLOW : classify(`docker ${group} ${action ?? ""}`.trim()));
     }
   }
+  // Package tools reach the network for the packages they are given. A URL, a git address or a
+  // registry flag names where the code comes from, in any subcommand and in any position.
+  const moduleTool = /^python3?$/.test(name) && args[0] === "-m" && args[1] ? args[1] : name;
+  const moduleArgs = moduleTool === name ? args : args.slice(2);
+  if (["pip", "pip3", "npm", "pnpm", "yarn", "bun", "cargo", "go", "uv"].includes(moduleTool)) {
+    const from = moduleArgs.find((a) => /^(git\+|https?:|ssh:|git:|github:|gitlab:|bitbucket:|file:)/i.test(a) || /^[\w.-]+\/[\w.-]+#/.test(a) || /^git@/.test(a) || /^(--index-url|--extra-index-url|--registry|--git)(=|$)/.test(a) || (/^pip/.test(moduleTool) && /^-i(=|$)/.test(a)));
+    if (from) return worst(verdict, ask(`${moduleTool} fetches code from outside the registry: ${clip80(from)}`));
+    if (moduleTool === "go") {
+      const sub = operands(moduleArgs)[0];
+      // go env -w writes the user's Go environment file, outside the project.
+      if (sub === "env" && moduleArgs.some((a) => /^-[a-zA-Z]*w[a-zA-Z]*$/.test(a))) return worst(verdict, ask("go env -w writes the user's Go environment file outside the project"));
+      // A module path with a host and a dot, or a version, is fetched from outside the registry.
+      if (sub === "install" || sub === "get") {
+        const remote = operands(moduleArgs).slice(1).find((a) => /^[\w.-]+\.[a-z]{2,}\//i.test(a) || /^[^/]+@[^/]+/.test(a));
+        if (remote) return worst(verdict, ask(`go ${sub} fetches a module from outside the registry: ${clip80(remote)}`));
+      }
+    }
+  }
   if (SUBCOMMANDS[name]) return worst(verdict, subcommand(name, args));
   if (READ_ONLY.has(name) || DEV_TOOLS.has(name)) return verdict;
-  if (/^python3?$/.test(name) && args[0] === "-m" && PY_MODULES.has(args[1]) && !cmd.heredoc) return verdict;
+  if (/^python3?$/.test(name) && args[0] === "-m" && PY_MODULES.has(args[1]) && !cmd.heredoc) {
+    // The module reads and writes like the tool of the same name: json.tool takes an input and an
+    // output operand, and the formatters rewrite the paths they are given. Credential reads were
+    // already checked above, so this must not return early.
+    const module = args[1];
+    const rest = args.slice(2);
+    if (module === "json.tool") {
+      const files = operands(rest);
+      const out = files.length >= 2 ? files[1] : undefined;
+      if (out !== undefined) {
+        const v = writePathVerdict("python -m json.tool", out, scope);
+        if (v) verdict = worst(verdict, v);
+      }
+    }
+    if (FORMATTERS[module]) {
+      const v = formatterVerdict(module, rest, scope);
+      if (v) verdict = worst(verdict, v);
+    }
+    return verdict;
+  }
   if (INTERPRETERS.has(name)) {
     // `python3 scripts/x.py`: the script is the first argument. Inline code (-c, -e, a heredoc) stays with the model.
     const script = !cmd.heredoc && args[0] && !args[0].startsWith("-") ? runFile(args[0], args.slice(1), scope) : undefined;
@@ -1262,7 +2518,7 @@ function evaluateParsed(parsed: Parsed, scope: Scope, depth: number): Verdict {
   const patterns = new Set<string | undefined>(parsed.opaque ? [undefined] : []);
   for (const cmd of parsed.cmds) {
     const [kw, name, inKw, ...values] = cmd.argv;
-    if (track && kw === "for" && inKw === "in" && values.every((w) => /^[\w./@:+-]+$/.test(w)) && namedOnce(name)) local.loopVars!.add(name);
+    if (track && kw === "for" && inKw === "in" && values.length > 0 && values.every((w) => /^[\w./@:+-]+$/.test(w) || /^https?:\/\/[^\s$`]+$/.test(w)) && namedOnce(name)) local.loopVars!.add(name);
     const part = simple(cmd, local, depth);
     if (part.action === "classify" || part.action === "ask") patterns.add(part.pattern);
     verdict = worst(verdict, part);
@@ -1271,13 +2527,21 @@ function evaluateParsed(parsed: Parsed, scope: Scope, depth: number): Verdict {
       if (["cd", "pushd", "popd"].includes(cmd.argv[0])) local.cwd = undefined;
     } else if (cmd.argv[0] === "cd" && local.cwd) {
       local.cwd = cmd.argv.length === 2 ? resolveWord(cmd.argv[1], local) : cmd.argv.length === 1 ? HOME : undefined;
+    } else if (cmd.argv[0] === "pushd" && local.cwd && cmd.argv.length === 2) {
+      // pushd with one directory moves the shell there, like cd.
+      local.cwd = resolveWord(cmd.argv[1], local);
     } else if (cmd.argv[0] === "pushd" || cmd.argv[0] === "popd") local.cwd = undefined;
     for (const [name, value] of (track && !cmd.subshell && assignments(cmd.argv)) || []) {
-      // A relative value is resolved where it is used, after any later `cd`, so only absolute
-      // ones are followed.
-      const expanded = expandVars(value, local);
-      const p = (/^(\/|~\/|~$)/.test(expanded) || path.isAbsolute(expanded)) ? resolveWord(value, local) : undefined;
-      if (p && namedOnce(name)) local.vars!.set(name, p);
+      // A relative literal is kept as text and resolved where it is used, so a later `cd` is
+      // honoured the way the shell honours it. A value built at run time is only followed when
+      // it expands to an absolute path.
+      if (/[$`]/.test(value)) {
+        const expanded = expandVars(value, local);
+        const p = (/^(\/|~\/|~$)/.test(expanded) || path.isAbsolute(expanded)) ? resolveWord(value, local) : undefined;
+        if (p && namedOnce(name)) local.vars!.set(name, p);
+      } else if (namedOnce(name)) {
+        local.vars!.set(name, value);
+      }
     }
   }
   return verdict.pattern && patterns.size > 1 ? { ...verdict, pattern: undefined } : verdict;
@@ -1347,7 +2611,290 @@ const PS_ALIASES: Record<string, string> = {
   kill: "stop-process", spps: "stop-process", saps: "start-process", start: "start-process",
 };
 
-/** Every command position is a reader and no writer or executor appears: no prompt. */
+// ---- PowerShell path expressions ----
+
+// Split a PowerShell segment into words, keeping a parenthesised expression or a quoted string
+// together: `-Path (Join-Path $HOME '.ssh/*')` is three words, not seven.
+function psExprWords(text: string): string[] {
+  const out: string[] = [];
+  let word = "";
+  let quote: string | undefined;
+  let depth = 0;
+  let has = false;
+  for (const c of text) {
+    if (quote) {
+      word += c;
+      if (c === quote) quote = undefined;
+      continue;
+    }
+    if (c === "'" || c === '"') { quote = c; word += c; has = true; continue; }
+    if (c === "(") { depth++; word += c; has = true; continue; }
+    if (c === ")") { if (depth > 0) depth--; word += c; has = true; continue; }
+    if (/\s/.test(c) && depth === 0) {
+      if (has) out.push(word);
+      word = "";
+      has = false;
+      continue;
+    }
+    word += c;
+    has = true;
+  }
+  if (has) out.push(word);
+  return out;
+}
+
+function psUnquote(s: string): string | undefined {
+  const t = s.trim();
+  if (t.length < 2 || (t[0] !== "'" && t[0] !== '"')) return undefined;
+  const quote = t[0];
+  for (let i = 1; i < t.length; i++) {
+    if (t[i] === "`") { i++; continue; }
+    if (t[i] === quote) return i === t.length - 1 ? t.slice(1, -1) : undefined;
+  }
+  return undefined;
+}
+
+function psBalanced(s: string): boolean {
+  let depth = 0;
+  let quote: string | undefined;
+  for (const c of s) {
+    if (quote) { if (c === quote) quote = undefined; continue; }
+    if (c === "'" || c === '"') quote = c;
+    else if (c === "(") depth++;
+    else if (c === ")" && --depth < 0) return false;
+  }
+  return depth === 0 && quote === undefined;
+}
+
+function psSplitTop(s: string, op: string): string[] {
+  const out: string[] = [];
+  let start = 0;
+  let quote: string | undefined;
+  let depth = 0;
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    if (quote) { if (c === quote) quote = undefined; continue; }
+    if (c === "'" || c === '"') quote = c;
+    else if (c === "(") depth++;
+    else if (c === ")") depth--;
+    else if (depth === 0 && s.startsWith(op, i)) {
+      out.push(s.slice(start, i));
+      start = i + op.length;
+      i += op.length - 1;
+    }
+  }
+  out.push(s.slice(start));
+  return out;
+}
+
+function psPlainLiteral(word: string): boolean {
+  const s = word.trim();
+  const unquoted = psUnquote(s);
+  if (unquoted !== undefined) return !(s.startsWith('"') && /[$`]/.test(unquoted));
+  return !/[$`()~+]/.test(s);
+}
+
+function psDirExists(p: string | undefined): boolean {
+  return !!p && !!fs.statSync(p, { throwIfNoEntry: false })?.isDirectory();
+}
+
+// Fold the simple expressions the corpus uses: a quoted literal, a variable assigned earlier, ~,
+// $HOME, $env:USERPROFILE, Join-Path and `+` concatenation. Anything else stays unknown.
+function psFoldPath(expr: string, vars: Map<string, string>): string | undefined {
+  let s = expr.trim();
+  if (!s) return undefined;
+  while (s.startsWith("(") && s.endsWith(")") && psBalanced(s.slice(1, -1))) s = s.slice(1, -1).trim();
+  const quoted = psUnquote(s);
+  if (quoted !== undefined) {
+    // Single quotes are literal; double quotes expand the home variables PowerShell knows.
+    if (s.startsWith('"')) {
+      const expanded = quoted.replace(/\$\{?home\}?/gi, HOME).replace(/\$\{?env:userprofile\}?/gi, HOME);
+      return /[$`]/.test(expanded) ? undefined : expanded;
+    }
+    return quoted;
+  }
+  if (/^\$[\w:]+$/i.test(s)) {
+    const name = s.toLowerCase();
+    if (name === "$home" || name === "$env:userprofile") return HOME;
+    if (name === "$env:temp" || name === "$env:tmp") return os.tmpdir();
+    return vars.get(name);
+  }
+  if (s === "~") return HOME;
+  if (/^~[\\/]/.test(s)) return path.join(HOME, s.slice(2));
+  // A home variable inside a larger path: $HOME/.aws, $env:USERPROFILE\Documents.
+  s = s.replace(/\$\{?home\}?/gi, HOME).replace(/\$\{?env:userprofile\}?/gi, HOME);
+  const join = /^join-path\b/i.exec(s);
+  if (join) {
+    const terms = psExprWords(s.slice(join[0].length).trim());
+    if (!terms.length) return undefined;
+    let out = psFoldPath(terms[0], vars);
+    if (out === undefined) return undefined;
+    for (const term of terms.slice(1)) {
+      const part = psFoldPath(term, vars);
+      if (part === undefined) return undefined;
+      out = path.join(out, part);
+    }
+    return out;
+  }
+  const plus = psSplitTop(s, "+");
+  if (plus.length > 1) {
+    let out = "";
+    for (const part of plus) {
+      const value = psFoldPath(part, vars);
+      if (value === undefined) return undefined;
+      out += value;
+    }
+    return out;
+  }
+  if (/[$`]/.test(s) || /[()]/.test(s)) return undefined;
+  return s.replace(/\\/g, "/");
+}
+
+// Variables assigned once in the same PowerShell line. A second assignment makes the value
+// unknown, so a later reader of that variable asks instead of being allowed.
+function psAssignments(text: string): Map<string, string> {
+  const counts = new Map<string, number>();
+  const vars = new Map<string, string>();
+  for (const m of text.matchAll(/(?:^|[;\n])\s*\$([A-Za-z_][\w:]*)\s*=\s*([^;\n]+)/g)) {
+    const name = `$${m[1].toLowerCase()}`;
+    const count = (counts.get(name) ?? 0) + 1;
+    counts.set(name, count);
+    const folded = psFoldPath(m[2], vars);
+    if (count === 1 && folded !== undefined) vars.set(name, folded);
+    else vars.delete(name);
+  }
+  return vars;
+}
+
+// Reader cmdlets whose argument names a file or a directory.
+const PS_PATH_READERS = new Set([
+  "get-content", "get-childitem", "get-item", "get-filehash", "get-acl", "get-command", "get-psdrive",
+  "get-location", "select-string", "select-xml", "get-help", "resolve-path", "test-path",
+]);
+const PS_DIR_READERS = new Set(["get-content", "get-childitem", "select-string", "select-xml"]);
+
+// The path arguments of a reader. A -Path family flag names them explicitly; otherwise the first
+// positional is the path (Select-String takes its pattern first).
+function psReaderPaths(words: string[], canonical: string): string[] {
+  const paths: string[] = [];
+  const positionals: string[] = [];
+  let sawPath = false;
+  for (let i = 1; i < words.length; i++) {
+    const word = words[i];
+    const eq = word.indexOf("=");
+    if (word.startsWith("-") && eq > 1) {
+      const flag = word.slice(0, eq).toLowerCase();
+      if (PS_PATH_FLAGS.has(flag)) { paths.push(word.slice(eq + 1)); sawPath = true; }
+      continue;
+    }
+    if (/^-[a-z][\w-]*$/i.test(word)) {
+      const flag = word.toLowerCase();
+      if (PS_PATH_FLAGS.has(flag)) {
+        if (words[i + 1] !== undefined) paths.push(words[++i]);
+        sawPath = true;
+      } else if (PS_VALUE_FLAGS.has(flag) || flag === "-pattern" || flag === "-algorithm") i++;
+      continue;
+    }
+    if (!word.startsWith("-")) positionals.push(word);
+  }
+  if (!sawPath) {
+    const at = canonical === "select-string" && positionals.length > 1 ? 1 : 0;
+    if (positionals[at] !== undefined) paths.push(positionals[at]);
+  }
+  return paths;
+}
+
+function psReadPathVerdict(word: string, canonical: string, scope: Scope | undefined, vars: Map<string, string>): Verdict | undefined {
+  const folded = psFoldPath(word, vars);
+  const plain = psPlainLiteral(word);
+  const fromVar = /^\$[\w:]+$/i.test(word.trim()) && vars.has(word.trim().toLowerCase());
+  if (folded === undefined) return plain || fromVar ? undefined : classify("PowerShell reads a path built from an expression");
+  const p = scope ? resolveWord(folded, scope) : path.isAbsolute(folded) ? realish(folded) : undefined;
+  if (p && scope && isGuarded(p, scope)) return guardAsk(`PowerShell reads the auto-mode guard's own files: ${word}`);
+  if (isSecretPath(expandHome(folded)) || (p && isSecretPath(p))) return criticalAsk(`PowerShell reads a credential file: ${word}`);
+  if (PS_DIR_READERS.has(canonical) && (isCredentialDirectory(expandHome(folded)) || (p && isCredentialDirectory(p)))) {
+    const stat = p ? fs.statSync(p, { throwIfNoEntry: false }) : fs.statSync(expandHome(folded), { throwIfNoEntry: false });
+    if (!stat || stat.isDirectory()) return criticalAsk(`PowerShell reads a directory that holds credentials: ${word}`);
+  }
+  if (!plain && !fromVar && p && scope && !isLocal(p, scope)) return classify(`PowerShell reads a path built from an expression: ${word}`);
+  return undefined;
+}
+
+function psCopySources(words: string[]): string[] {
+  const paths: string[] = [];
+  const positionals: string[] = [];
+  let destination: string | undefined;
+  for (let i = 1; i < words.length; i++) {
+    const word = words[i];
+    const eq = word.indexOf("=");
+    if (word.startsWith("-") && eq > 1) {
+      const flag = word.slice(0, eq).toLowerCase();
+      if (flag === "-destination") destination = word.slice(eq + 1);
+      else if (PS_PATH_FLAGS.has(flag)) paths.push(word.slice(eq + 1));
+      continue;
+    }
+    if (/^-[a-z][\w-]*$/i.test(word)) {
+      const flag = word.toLowerCase();
+      if (flag === "-destination") { if (words[i + 1] !== undefined) destination = words[++i]; }
+      else if (PS_PATH_FLAGS.has(flag)) { if (words[i + 1] !== undefined) paths.push(words[++i]); }
+      else if (PS_VALUE_FLAGS.has(flag)) i++;
+      continue;
+    }
+    if (!word.startsWith("-")) positionals.push(word);
+  }
+  if (destination !== undefined && positionals.length > 1) positionals.pop();
+  else if (destination === undefined && positionals.length > 1) positionals.pop();
+  const sources = [...paths, ...positionals];
+  return sources.filter((s) => s !== destination);
+}
+
+function psCopySourceVerdict(word: string, scope: Scope | undefined, vars: Map<string, string>): Verdict | undefined {
+  const folded = psFoldPath(word, vars);
+  if (folded === undefined) return classify("PowerShell copies from a path built from an expression");
+  const p = scope ? resolveWord(folded, scope) : path.isAbsolute(folded) ? realish(folded) : undefined;
+  if (p && scope && isGuarded(p, scope)) return guardAsk(`PowerShell copies the auto-mode guard's own files: ${word}`);
+  if (isSecretPath(expandHome(folded)) || (p && isSecretPath(p)) || (p && psDirExists(p) && isCredentialDirectory(p))) return criticalAsk(`PowerShell copies a credential file: ${word}`);
+  if (p && scope && !isLocal(p, scope)) return classify(`PowerShell copies from outside the working directory: ${word}`);
+  return undefined;
+}
+
+// New-Item's other end: a symbolic link, junction or hard link makes a later project-looking path
+// reach whatever it names, so the target is checked while it is still visible.
+function psLinkVerdict(word: string, scope: Scope | undefined, vars: Map<string, string>): Verdict | undefined {
+  const folded = psFoldPath(word, vars);
+  if (folded === undefined) return classify("PowerShell creates a link to a path built from an expression");
+  const p = scope ? resolveWord(folded, scope) : path.isAbsolute(folded) ? realish(folded) : undefined;
+  if (p && scope && isGuarded(p, scope)) return guardAsk(`PowerShell links to the auto-mode guard's own files: ${word}`);
+  if (p && scope && isPiFile(p, scope)) return guardAsk(`PowerShell links to Pi's own files: ${word}`);
+  if (isSecretPath(expandHome(folded)) || (p && isSecretPath(p)) || (p && psDirExists(p) && isCredentialDirectory(p)) || (p && isRootLike(p) && !inTmp(p))) {
+    return criticalAsk(`PowerShell links to a credential location or its parent: ${word}`);
+  }
+  if (p && scope && !isLocal(p, scope)) return outside(`PowerShell links to a target outside the working directory: ${word}`, p);
+  return undefined;
+}
+
+function psReadVerdict(text: string, scope: Scope | undefined, vars: Map<string, string>): Verdict | undefined {
+  let verdict: Verdict | undefined;
+  for (const segment of psSegments(text)) {
+    const words = psExprWords(segment);
+    if (!words.length) continue;
+    if (words[0].startsWith("$") && words[1] === "=") continue;
+    const canonical = PS_ALIASES[words[0].toLowerCase()] ?? words[0].toLowerCase();
+    if (canonical === "copy-item" || canonical === "move-item") {
+      for (const source of psCopySources(words)) {
+        const v = psCopySourceVerdict(source, scope, vars);
+        if (v) verdict = verdict ? worst(verdict, v) : v;
+      }
+    } else if (PS_PATH_READERS.has(canonical)) {
+      for (const word of psReaderPaths(words, canonical)) {
+        const v = psReadPathVerdict(word, canonical, scope, vars);
+        if (v) verdict = verdict ? worst(verdict, v) : v;
+      }
+    }
+  }
+  return verdict;
+}
+
 export function powershellVerdict(command: string, _scope?: Scope): Verdict {
   const text = command.replace(/\r/g, "");
   // Text inside quotes cannot run, so only the bare text decides what runs.
@@ -1364,14 +2911,33 @@ export function powershellVerdict(command: string, _scope?: Scope): Verdict {
     }
   }
   const bare = text.replace(/'[^']*'/g, "''").replace(/"[^"]*"/g, '""');
+  const bareWriters = bare.replace(/\bset-(strictmode|location|psdebug)\b/gi, "safe");
+  // File writes are allowed only when every literal target is provably inside the project or
+  // temp. Without a scope, or with a target the vocabulary cannot read, the critical ask stays.
+  const readVerdict = psReadVerdict(text, _scope, psAssignments(text));
+  const writes = psWrites(text, bareWriters, _scope);
+  if (writes.found && !writes.ok) return worst(readVerdict ?? ALLOW, writes.verdict!);
+  // A credential read or a guard-file read is the stricter answer. A classify from the path
+  // vocabulary waits, so a later critical check can still win.
+  if (readVerdict?.action === "ask") return readVerdict;
+  const writesOk = writes.found && writes.ok;
+  // The environment holds tokens. Printing one of them puts it in the transcript; PATH, HOME
+  // and NODE_ENV are settings, not credentials.
+  for (const m of text.matchAll(/\$\{?env:(\w+)\}?/gi)) {
+    if (isSecretEnvName(m[1])) return classify("prints environment variables, which can hold tokens");
+  }
+  if (/\b(get-childitem|gci|dir|ls|gi)\b[^|;\n]*\s(env:|environment::)/i.test(bare)) return classify("prints environment variables, which can hold tokens");
   if (/\b(iex|invoke-expression|invoke-command|icm)\b/i.test(bare) || /-e(nc|ncodedcommand)?\b/i.test(bare)) return criticalAsk("PowerShell evaluates or runs an encoded command");
   // A method call or a static .NET call is outside the cmdlet vocabulary; only pure types pass.
   if (PS_DESTRUCTIVE_METHODS.test(bare)) return criticalAsk("PowerShell calls a method that changes files");
   if (/[)\]]\s*\.\s*\w+\s*\(/.test(bare)) return criticalAsk("PowerShell calls a method on an expression");
   for (const call of bare.matchAll(/\[([\w.]+)\]\s*::/g)) {
-    if (!PS_PURE_TYPES.has(call[1].toLowerCase().replace(/^system\./, ""))) return criticalAsk(`PowerShell calls ${call[1]}`);
+    const type = call[1].toLowerCase().replace(/^system\./, "");
+    // Reading a setting from the environment is a read, unless the name holds a token.
+    if (type === "environment" && /\[(?:system\.)?environment\]\s*::\s*getenvironmentvariable\s*\(\s*''/i.test(bare) && [...text.matchAll(/getenvironmentvariable\s*\(\s*["']([^"']+)/gi)].every((m) => !isSecretEnvName(m[1])) && !/\[(?:system\.)?environment\]\s*::\s*(?!getenvironmentvariable)/i.test(bare)) continue;
+    if (!PS_PURE_TYPES.has(type)) return _scope ? classify(`PowerShell calls ${call[1]}`) : criticalAsk(`PowerShell calls ${call[1]}`);
   }
-  if (/(^|[^>])(\d|\*)?>>?\s*(?!\$null\b)[^&\s]/i.test(bare) || /\b(out-file|tee-object)\b/i.test(bare)) return criticalAsk("PowerShell writes a file");
+  if (!writesOk && (/(^|[^>])(\d|\*)?>>?\s*(?!\$null\b)[^&\s]/i.test(bare) || /\b(out-file|tee-object)\b/i.test(bare))) return criticalAsk("PowerShell writes a file");
   // ForEach-Object given a member name calls it: `gci | % Delete`, `gsv x | % Stop`. Only plain
   // property reads pass.
   for (const m of bare.matchAll(/(?:^|[|;\s(])(?:%|foreach-object|foreach)\s+(?:-membername\s+)?([A-Za-z_]\w*)/gi)) {
@@ -1387,27 +2953,239 @@ export function powershellVerdict(command: string, _scope?: Scope): Verdict {
     if (!_scope && w && isSecretPath(expandHome(w))) return criticalAsk(`PowerShell reads a credential file: ${w}`);
   }
   // Set-StrictMode and Set-Location only change the shell itself, like cd.
-  const bareWriters = bare.replace(/\bset-(strictmode|location|psdebug)\b/gi, "safe");
   const writer = PS_WRITERS.exec(bareWriters);
-  if (writer) return criticalAsk(`PowerShell runs ${writer[0].trim()}`);
+  if (writer && !writesOk) return _scope ? ask(`PowerShell runs ${writer[0].trim()}`) : criticalAsk(`PowerShell runs ${writer[0].trim()}`);
   // A writer written as an alias (rm, sc, si, ni, cp, mv…) is a writer too.
   for (const word of bare.split(/[\s|;(){}[\]]+/)) {
     const canonical = PS_ALIASES[word.toLowerCase()];
     if (canonical && !PS_READERS.has(canonical) && !PS_READER_PREFIXES.some((p) => canonical.startsWith(p))) {
+      if (writesOk) {
+        const left = writes.aliases?.get(canonical) ?? 0;
+        if (left > 0) {
+          writes.aliases!.set(canonical, left - 1);
+          continue;
+        }
+      }
       return criticalAsk(`PowerShell runs ${word} (${canonical})`);
     }
   }
   for (const piece of bare.split(/\n|;|\|/)) {
     // Strip an assignment, then skip the pieces that are not a command: a hashtable entry, a
-    // subexpression, a continuation of a block, a comment or a bare string.
+    // subexpression, a continuation of a block, a comment or a bare string. A bare variable is
+    // a read ("$env:PATH" prints it) and a validated local writer is allowed with its write.
     const line = piece.trim().replace(/^\$[\w:]+(\[[^\]]*\])?\s*=\s*/, "");
-    if (!line || /^[@({[}\])#'"-]/.test(line) || /^[\w.'"]+=/.test(line)) continue;
+    if (!line || /^[@({[}\])\'"#-]/.test(line) || /^[\w.'"]+=/.test(line) || /^\$(?:[\w:]+|\{[\w:]+\})(\.[\w]+)*$/.test(line)) continue;
     const word = line.split(/\s+/)[0].replace(/^microsoft\.[\w.]*\\/i, "").toLowerCase();
     const canonical = PS_ALIASES[word] ?? word;
     if (PS_READERS.has(canonical) || PS_READER_PREFIXES.some((p) => canonical.startsWith(p))) continue;
+    if (writesOk && PS_LOCAL_WRITERS.has(canonical)) continue;
+    // A native program (git, npm, node), not a cmdlet: the shell rules know what these do. Only a
+    // plain line, since PowerShell syntax in it would be misread as bash.
+    if (_scope && !/^[a-z]+-[a-z]/.test(word)) {
+      const original = text.split(/\n|;|\|/).map((p) => p.trim()).find((p) => p.toLowerCase().startsWith(word));
+      if (original && !/[$@(){}`]/.test(original)) {
+        const native = bashVerdict(original, _scope);
+        if (native.action === "allow") continue;
+        return native;
+      }
+    }
     return ask(`PowerShell ${word} needs review`);
   }
-  return ALLOW;
+  return worst(readVerdict ?? ALLOW, ALLOW);
+}
+
+// ---- scripts and inline programs a command runs ----
+
+// What an action will run, found with the same parser the rules use. Pure: nothing here starts a
+// process or touches the network. Paths are absolute; `inline` holds the code given to an
+// interpreter or a shell, with a rough language name.
+export interface RunTargets {
+  scripts: string[];
+  inline: { code: string; lang: string }[];
+}
+
+const RUN_INTERPRETERS: Record<string, string> = {
+  node: "js", nodejs: "js", tsx: "ts", "ts-node": "ts", "ts-node-esm": "ts", "ts-node-script": "ts", esno: "ts", jiti: "ts",
+  python: "python", python3: "python", perl: "perl", ruby: "ruby", php: "php", lua: "lua",
+  deno: "js", bun: "js",
+};
+const RUN_PROGRAMS = new Set([...Object.keys(RUN_INTERPRETERS), "bash", "sh", "zsh", "dash", "ksh", "powershell", "pwsh"]);
+// Options that take the next word as a value, so it is not a script file.
+const RUN_VALUE_FLAGS = new Set([
+  "-W", "-X", "-Q", "-c", "--config", "--import-map", "--cert", "--location", "-L", "--log-level", "--seed", "--v8-flags",
+  "--ext", "--cwd", "--input-type", "--conditions", "--env-file", "--tsconfig", "--title", "--inspect-port",
+]);
+
+/** Every script file and inline program a shell command runs. It resolves scripts against the
+ * tracked working directory, also behind `cd`, `timeout`, `bash -c`, pipes and `$(...)`. */
+export function runTargets(command: string, scope: Scope): RunTargets {
+  const out: RunTargets = { scripts: [], inline: [] };
+  const seen = new Set<string>();
+  const add = (p: string | undefined) => {
+    if (p && !seen.has(p)) {
+      seen.add(p);
+      out.scripts.push(p);
+    }
+  };
+  walkRuns(parse(command), scope, out, add, 0);
+  return out;
+}
+
+function walkRuns(parsed: Parsed, scope: Scope, out: RunTargets, add: (p?: string) => void, depth: number) {
+  if (depth > 5) return;
+  const local: Scope = { ...scope };
+  // A `cd` inside a command substitution only moves that subshell; the commands after it in the
+  // substitution resolve against it, those after the substitution resolve against the outer cwd.
+  let subCwd: string | undefined;
+  for (const cmd of parsed.cmds) {
+    const first = path.basename(cmd.argv[0] ?? "");
+    const at = cmd.subshell ? subCwd ?? local.cwd : local.cwd;
+    if (first === "cd" || first === "pushd" || first === "popd") {
+      if (cmd.subshell) {
+        subCwd = first === "cd" && cmd.argv.length === 2 ? resolveWord(cmd.argv[1], { ...local, cwd: at }) : undefined;
+      } else if (first === "cd") {
+        local.cwd = cmd.argv.length === 2 ? resolveWord(cmd.argv[1], local) : cmd.argv.length === 1 ? HOME : undefined;
+        subCwd = undefined;
+      } else {
+        local.cwd = undefined;
+        subCwd = undefined;
+      }
+      continue;
+    }
+    if (!cmd.subshell) subCwd = undefined;
+    collectRuns(cmd.argv, { ...local, cwd: at }, cmd, out, add, depth);
+  }
+}
+
+function collectRuns(argv: string[], scope: Scope, cmd: Simple, out: RunTargets, add: (p?: string) => void, depth: number) {
+  if (depth > 5) return;
+  let words = unwrap(argv);
+  // sudo runs the rest of the line as root; its own options come first.
+  while (words.length && /^(sudo|doas)$/i.test(path.basename(words[0]))) words = afterFlags(words.slice(1), /^-[ugCDhpRrTU]$/);
+  if (!words.length) return;
+  const program = words[0];
+  const args = words.slice(1);
+  const base = path.basename(program).toLowerCase();
+  const name = base.replace(/\.(exe|cmd|bat)$/i, "");
+  if (program === "." || name === "source") {
+    const file = args.find((a) => !a.startsWith("-"));
+    if (file) add(resolveWord(file, scope));
+    return;
+  }
+  if (["bash", "sh", "zsh", "dash", "ksh"].includes(name)) return shellRuns(args, cmd, scope, out, add, depth);
+  if (name === "powershell" || name === "pwsh") return powershellRuns(args, scope, out, add);
+  if (name === "cmd") {
+    const at = args.findIndex((a) => /^\/[ck]$/i.test(a));
+    if (at >= 0) out.inline.push({ code: args.slice(at + 1).join(" "), lang: "cmd" });
+    return;
+  }
+  if (["npx", "pnpx", "bunx"].includes(name)) return runnerRuns(args, scope, out, add, depth);
+  if (name === "npm" && /^exec$/i.test(args[0] ?? "")) return runnerRuns(args.slice(1).filter((a) => a !== "--"), scope, out, add, depth);
+  if (RUNNERS[name] && args[0] === RUNNERS[name]) {
+    const inner = afterFlags(args.slice(1), /^(--with|--python|-p|--project|--group|--extra|--env-file|--directory)$/);
+    if (inner.length) collectRuns(inner, scope, { argv: inner, out: [] }, out, add, depth + 1);
+    return;
+  }
+  if (RUN_INTERPRETERS[name] || /^python\d+(\.\d+)?$/.test(name)) {
+    return interpreterRuns(name, RUN_INTERPRETERS[name] ?? "python", args, cmd, scope, out, add);
+  }
+  // A program named by its path runs that file.
+  if (/[\\/]/.test(program)) add(resolveWord(program, scope));
+}
+
+function shellRuns(args: string[], cmd: Simple, scope: Scope, out: RunTargets, add: (p?: string) => void, depth: number) {
+  for (let i = 0; i < args.length; i++) {
+    const arg = args[i];
+    // -c carries the program as text; the same parser reads what it runs.
+    if (/^-[a-zA-Z]*c$/.test(arg)) {
+      const code = args[i + 1] ?? "";
+      out.inline.push({ code, lang: "bash" });
+      if (code && depth < 5) walkRuns(parse(code), scope, out, add, depth + 1);
+      return;
+    }
+    // -n only checks the syntax and runs nothing.
+    if (arg === "-n") return;
+    if (/^[-+]o$/.test(arg)) { i++; continue; }
+    if (arg.startsWith("-")) continue;
+    if (arg === "-") break;
+    add(resolveWord(arg, scope));
+    return;
+  }
+  // No script file: a heredoc gives the shell its program.
+  if (cmd.heredoc) for (const body of cmd.heredocBodies ?? []) out.inline.push({ code: body, lang: "bash" });
+}
+
+function interpreterRuns(name: string, lang: string, args: string[], cmd: Simple, scope: Scope, out: RunTargets, add: (p?: string) => void) {
+  let i = 0;
+  if ((name === "deno" || name === "bun") && /^(run|x)$/i.test(args[0] ?? "")) i = 1;
+  if (name === "deno" && /^eval$/i.test(args[0] ?? "")) {
+    out.inline.push({ code: args[1] ?? "", lang: "js" });
+    return;
+  }
+  for (; i < args.length; i++) {
+    const arg = args[i];
+    // -e is the eval flag of every interpreter; python and the shell-like ones use -c, php -r.
+    const evalFlag = arg === "-e" || arg === "--eval" || arg === "-p" || arg === "--print" || (arg === "-c" && lang !== "js") || (arg === "-r" && lang === "php");
+    if (evalFlag || /^--eval=/.test(arg)) {
+      const text = arg.includes("=") ? arg.slice(arg.indexOf("=") + 1) : args[++i] ?? "";
+      out.inline.push({ code: text, lang });
+      continue;
+    }
+    // Node loads a required or imported module before the script: that file runs too.
+    if ((name === "node" || name === "nodejs") && ["-r", "--require", "--import", "--loader", "--experimental-loader"].includes(arg)) {
+      add(resolveWord(args[++i] ?? "", scope));
+      continue;
+    }
+    // python -m names a module, not a file.
+    if (arg === "-m" && lang === "python") return;
+    if (arg === "-") break;
+    if (arg.startsWith("-")) {
+      if (RUN_VALUE_FLAGS.has(arg)) i++;
+      continue;
+    }
+    add(resolveWord(arg, scope));
+    return;
+  }
+  if (cmd.heredoc) for (const body of cmd.heredocBodies ?? []) out.inline.push({ code: body, lang });
+}
+
+function powershellRuns(args: string[], scope: Scope, out: RunTargets, add: (p?: string) => void) {
+  const at = args.findIndex((a) => /^-(command|c)$/i.test(a));
+  if (at >= 0) {
+    out.inline.push({ code: args.slice(at + 1).join(" "), lang: "powershell" });
+    return;
+  }
+  const encoded = args.findIndex((a) => /^-(e|ec|encodedcommand)$/i.test(a));
+  if (encoded >= 0) {
+    let code = "";
+    try { code = Buffer.from(args[encoded + 1] ?? "", "base64").toString("utf16le").replace(/\0+$/, ""); } catch { code = ""; }
+    if (code.trim()) out.inline.push({ code, lang: "powershell" });
+    return;
+  }
+  const file = args.findIndex((a) => /^-(file|f)$/i.test(a));
+  const script = file >= 0 ? args[file + 1] : args.find((a) => !a.startsWith("-") && /\.(ps1|psm1)$/i.test(a));
+  if (script) add(resolveWord(script, scope));
+}
+
+// npx, pnpx and bunx run the package named after their own options.
+function runnerRuns(args: string[], scope: Scope, out: RunTargets, add: (p?: string) => void, depth: number) {
+  let i = 0;
+  for (; i < args.length; i++) {
+    const arg = args[i];
+    if (arg === "-c" || arg === "--call") {
+      const code = args[i + 1] ?? "";
+      out.inline.push({ code, lang: "bash" });
+      if (code && depth < 5) walkRuns(parse(code), scope, out, add, depth + 1);
+      return;
+    }
+    if (arg === "-p" || arg === "--package" || arg === "--node-options" || /^--node-options=/.test(arg)) { i++; continue; }
+    if (arg.startsWith("-")) continue;
+    break;
+  }
+  // `tsx@4` names the same package as `tsx`.
+  const pkg = (args[i] ?? "").replace(/@[^/]*$/, "");
+  if (!pkg || !(RUN_PROGRAMS.has(pkg.toLowerCase()) || /^python\d+(\.\d+)?$/i.test(pkg))) return;
+  collectRuns([pkg, ...args.slice(i + 1)], scope, { argv: [pkg, ...args.slice(i + 1)], out: [] }, out, add, depth + 1);
 }
 
 // write and edit tools.
@@ -1419,6 +3197,9 @@ export function fileVerdict(tool: string, target: string, scope: Scope): Verdict
   // For the chat decider an edit makes a file of no known origin one the session wrote, so a
   // project script the agent changed goes to it when run.
   if (tool === "write" || (scope.chatDecider && p && originOf(p, scope) === undefined)) note(p, "authored", scope);
+  // Git runs what its own directory says: a hook, or config that names a command. The write tool
+  // reaches these as easily as a shell does.
+  if (p && /(^|[\\/])\.git[\\/]/.test(p)) return outwardClassify(`${tool} changes git's own files, which git acts on later: ${target}`);
   return isLocal(p, scope) ? ALLOW : forDecider(outside(`${tool} outside the working directory: ${target}`, p), scope);
 }
 

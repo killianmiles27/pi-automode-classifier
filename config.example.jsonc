@@ -2,7 +2,38 @@
 // The config file is plain JSON: drop these comments, and keep only the keys you change. A key
 // you leave out keeps its default. A config with any error is ignored as a whole.
 {
-  // Starting state of each session. `/automode-classifier on|off` changes it for that session.
+  // Starting mode of each session; /mode and Alt+M change it for that session.
+  // "safe": runs almost everything and asks you only about what stays unresolved.
+  // "autonomous": never asks; the judges decide, and what they will not clear is blocked.
+  // "yolo": this guard is off.
+  "mode": "safe",
+  // The decision core, used with "decider": [..., "context"]. secondOpinion sends what Jev leaves
+  // gray to the chat model set in `llm`. The other keys are thresholds on Jev's four answers:
+  // serves the task, named by the user, lasting harm, suspicious. docs/SPEC-auto-modes.md has the logic.
+  "judge": {
+    "secondOpinion": true,
+    // When Jev is down or out of quota, the chat model answers its four questions instead.
+    "chatScorer": true,
+    "denyHarmAbove": 0.85,
+    "denySuspiciousAbove": 0.85,
+    "denyNamedBelow": 0.25,
+    "localHarmBelow": 0.5,
+    "localSuspiciousBelow": 0.5,
+    "namedAbove": 0.7,
+    "namedSuspiciousBelow": 0.5,
+    "gatedNamedAbove": 0.45,
+    "stepServesAbove": 0.6,
+    "stepHarmBelow": 0.3,
+    "stepSuspiciousBelow": 0.3,
+    "harmlessHarmBelow": 0.1,
+    "harmlessSuspiciousBelow": 0.2,
+    "harmlessServesAbove": 0.2,
+    "fallbackHarmBelow": 0.2,
+    "fallbackSuspiciousBelow": 0.2,
+    "suspiciousStopsAbove": 0.6,
+    "wrapUpAfterBlocks": 5
+  },
+  // false starts in yolo. Kept for older configs; prefer "mode".
   "enabled": true,
   // Append every decision to ~/.local/state/pi-automode-classifier/decisions.jsonl.
   "log": true,

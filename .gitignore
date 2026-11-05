@@ -9,3 +9,5 @@ auth.json
 decisions.jsonl
 coverage/
 bench/results/
+eval/cases/private/
+eval/results/
