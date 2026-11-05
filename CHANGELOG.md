@@ -1,5 +1,23 @@
 # Changelog
 
+## 0.6.0
+
+Two modes replace Auto. `docs/AUTO-MODES.md` has how they decide, setup, results and limits.
+
+- **Auto Mode Safe** (`/mode safe`, `/mode auto` still works) asks only about what stays unresolved. **Auto Mode Autonomous** (`/mode autonomous`) never asks: what the judges will not clear is blocked, listed in `/automode blocked`, and the agent carries on. Alt+M cycles safe, autonomous and yolo. A child Pi inherits safe or autonomous, never yolo.
+- **Effects analysis** (`effects.ts`) reads the code a call runs, without running it: network, credentials, whole-environment reads, outside writes and deletes, dynamic and obfuscated code, for JS, TS, Python, shell and PowerShell, and plain text for other languages. Imports are followed.
+- **Floors** (`judge.ts`) no model can overrule. The guard's own files are never cleared by a model. Credentials, root, downloaded code and dangerous code need your words and a second opinion. Anything acting outside the project needs your words. A strong suspicious signal cannot be talked away.
+- **Jev is better informed.** It gets the task from your first substantial message, kept whole at both ends, plus measured effects and recent commands, and answers four questions: serves the task, named by you, lasting harm, suspicious.
+- **Second opinion**: the chat model decides what Jev leaves gray. **Fallback**: when Jev is down or out of quota, the chat model answers its questions.
+- **Review memory**: the same call over the same content gets the same decision, and a changed file is a new review. "Allow while unchanged" replaces exact-text session allow, and a script that changes while a prompt is open is reviewed again.
+- **Runner scan**: `npm test`, `make` and similar read what they will invoke and everything changed since the session began, so editing a test to exfiltrate and then running it is caught. A file counts as the project's only once committed or ignored.
+- **Write-time scan**: dangerous content is stopped when written, including hooks and files in other languages.
+- **Prompts** show why, what the code does, each judge's answer in words and how much was clipped, with "View full action" returning to the menu.
+- **Agent guidance** in the system prompt reduces avoidable prompts, and in autonomous tells the agent not to wait for approval.
+- **Rules**: Orca coordination by subcommand; guard bypasses such as `pi --no-extensions` and `PI_AUTOMODE_MODE=`; secrets behind globs, braces, variables and links; write and exec flags on tools that were allowed (`sort -o`, `sed w`, `man -P`, `rg --pre`, `tar --to-command`, `git -c core.hooksPath`, `git log --output`, abbreviated long options, environment prefixes such as `GIT_DIR=` and `MAKEFLAGS=`); PowerShell writes inside the project and native programs in PowerShell.
+- **Fixes**: a config with a BOM, as Windows PowerShell's `Set-Content` writes, was ignored and the guard silently ran on defaults. The second opinion and explainer now send the session id, without which OpenCode Go refuses the call. Long requests keep both ends for the second opinion.
+- **`eval/`**: a labelled corpus, two red-team rounds, replays of your own sessions, and a live lab with real Pi, a compromised agent and canaries. `test-hostile.mjs` holds every analyzer to a time limit on pathological input, after a hang froze a session.
+
 ## Unreleased
 
 - Add `docs/TUNING.md`: the read-only rule changes, the PowerShell vocabulary, and the opt-in thresholds that cut prompts, with the measured effect and the review fixes that closed the bypasses.

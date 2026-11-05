@@ -1,3 +1,5 @@
+// A parent Pi's mode must not change what these tests expect.
+delete process.env.PI_AUTOMODE_MODE;
 // Checks the deterministic rules in rules.ts and the tool_call handler in index.ts. No model or
 // server is needed: a small stand-in process plays the classifier. The commands under test are
 // only named, never run. The test itself runs git to make a scratch repository under $HOME.

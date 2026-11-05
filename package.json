@@ -1,7 +1,7 @@
 {
   "name": "pi-automode-classifier",
-  "version": "0.5.1",
-  "description": "Auto mode for Pi: rules, a local classifier, then a decider that checks whether you asked for the call",
+  "version": "0.6.0",
+  "description": "Auto mode for Pi. Auto Mode Safe asks only when it must; Auto Mode Autonomous never asks. Rules, measured code effects, Jev and a second opinion decide.",
   "keywords": [
     "pi-package",
     "pi-extension",
@@ -28,6 +28,8 @@
     "rules.ts",
     "automode.ts",
     "automode-rules.json",
+    "effects.ts",
+    "judge.ts",
     "config.example.jsonc",
     "systemd",
     "lancet",
@@ -37,7 +39,9 @@
     "LICENSE"
   ],
   "scripts": {
-    "test": "node test.mjs && node test-context.mjs && node test-modes.mjs",
+    "test": "node test.mjs && node test-rules-v2.mjs && node test-effects.mjs && node test-judge.mjs && node test-context.mjs && node test-modes.mjs && node test-hostile.mjs",
+    "eval": "node eval/run.mjs --jev live --judge live",
+    "eval:live": "node eval/live/run.mjs",
     "test:windows": "node test-windows.mjs",
     "bench": "node bench/run.mjs --stages classifier",
     "bench:llm": "node bench/run.mjs --stages llm --suites user-requests,bench-llm-cases",

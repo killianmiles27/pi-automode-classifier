@@ -14,6 +14,12 @@ I built it because Pi runs every tool call without asking for approval, and I wa
 
 It is not a sandbox. It guards the agent's tool calls. It doesn't guard `!` commands you type, and extensions run with your user's permissions. Read [Pi's security docs](https://pi.dev/docs/latest/security) for real isolation.
 
+## Auto Mode Safe and Auto Mode Autonomous
+
+This fork has two working modes. **Auto Mode Safe** (`/mode safe`) runs almost everything and asks you only about what stays unresolved. **Auto Mode Autonomous** (`/mode autonomous`) never asks: the judges decide, what they will not clear is blocked, and the agent carries on and reports it. Alt+M cycles through them and YOLO. [docs/AUTO-MODES.md](docs/AUTO-MODES.md) has how decisions are made, the setup, measured results, and what they do not protect against.
+
+The rest of this README describes the parts they are built from. The decider section below describes the fork's earlier `authorized`/`harmful` questions, which the published benchmark still uses; live decisions now use four questions and measured code effects.
+
 ## This fork: a decider that knows what you asked for
 
 > Fork of [deepu105/pi-automode-classifier](https://github.com/deepu105/pi-automode-classifier) 0.3.0. Everything below this section is upstream's documentation and still applies.
