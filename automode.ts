@@ -30,6 +30,9 @@ export interface LlmConfig {
   // error, never a switch to the session model.
   provider: string;
   model: string;
+  // Tried once, with the same settings, when the model above gives no answer (down, overloaded,
+  // timed out). Empty model: no fallback. It is never used for a model that answered.
+  fallback: { provider: string; model: string };
   // Name in the decision log and `/automode-classifier status`. Empty: the model id.
   name: string;
   // These override the Pi catalog entry for the model, so the same entry can be pointed at a
@@ -75,6 +78,7 @@ export interface LlmConfig {
 export const DEFAULT_LLM: LlmConfig = {
   provider: "",
   model: "",
+  fallback: { provider: "", model: "" },
   name: "",
   contextWindow: 0,
   maxTokens: 2048,

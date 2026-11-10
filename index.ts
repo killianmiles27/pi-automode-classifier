@@ -115,6 +115,12 @@ export interface Config {
   // More files or directories that count as the guard's own (changes to them always ask),
   // for example the server's unit file. `~` is expanded.
   guardedPaths: string[];
+  remote: {
+    // ssh hosts you trust, as an alias from ~/.ssh/config or user@host. A command run there that
+    // only reads (ls, find, df, docker ps) runs; with sudo it goes to the judges; a change still
+    // needs your words. Every other host keeps the usual ask.
+    trustedHosts: string[];
+  };
   withoutUi: {
     // What happens to a call that needs a prompt when there is no UI to show it.
     onAsk: "block" | "allow";
@@ -188,6 +194,7 @@ export const DEFAULTS: Config = {
   rules: { deny: [], ask: [], classify: [], allow: [] },
   allowedPaths: [],
   guardedPaths: [],
+  remote: { trustedHosts: [] },
   withoutUi: { onAsk: "block", rules: { allow: [], deny: [] } },
   decider: ["llm"],
   // Of the question designs compared on bench/suites/bench-cases.jsonl, one yes/no question with both answers
@@ -265,6 +272,7 @@ const SCHEMA: Schema = {
   rules: { deny: isStrings, ask: isStrings, classify: isStrings, allow: isStrings },
   allowedPaths: isStrings,
   guardedPaths: isStrings,
+  remote: { trustedHosts: (v) => isStrings(v) && (v as string[]).every((h) => /^[\w.@:-]+$/.test(h)) },
   withoutUi: { onAsk: oneOf("block", "allow"), rules: { allow: isStrings, deny: isStrings } },
   decider: (v) => isStrings(v) && (v as string[]).every((d) => ["llm", "context", "classifier", "command"].includes(d)) && new Set(v as string[]).size === (v as string[]).length,
   classifier: {
@@ -284,6 +292,7 @@ const SCHEMA: Schema = {
   llm: {
     provider: isString,
     model: isString,
+    fallback: { provider: isString, model: isString },
     name: isString,
     contextWindow: (v) => v === 0 || atLeast(1024)(v),
     maxTokens: atLeast(16),
@@ -612,8 +621,9 @@ export interface ChatRegistry {
 }
 
 export type LlmDecision =
-  | { block: false; why: string; stage: string; ms: number; tokens?: number }
-  | { block: true; category?: string; reason: string; stage: string; ms: number; tokens?: number }
+  // `via`: the fallback model that answered, when the configured one did not.
+  | { block: false; why: string; stage: string; ms: number; tokens?: number; via?: string }
+  | { block: true; category?: string; reason: string; stage: string; ms: number; tokens?: number; via?: string }
   // `unparsed`: the model answered, but not with a verdict. `lasting`: asking again fails the same
   // way (no such model, or the call does not fit its window).
   | { error: string; unparsed?: boolean; lasting?: boolean; ms: number; tokens?: number };
@@ -706,6 +716,26 @@ async function askOnce(
 // Claude Code's pipeline for one action: the transcript plus the action go in one user message,
 // stage 1 filters, stage 2 reasons about what stage 1 flagged.
 export async function decideWithLlm(
+  config: Config,
+  items: TranscriptItem[],
+  signal?: AbortSignal,
+  registry?: ChatRegistry,
+  sessionModel?: Record<string, unknown>,
+  sessionId?: string,
+): Promise<LlmDecision> {
+  const first = await decideOnce(config, items, signal, registry, sessionModel, sessionId);
+  const fb = config.llm.fallback;
+  // Only a model that gave no answer is replaced. One that answered without a verdict is not
+  // retried elsewhere, and a cancelled call stays cancelled.
+  if (!("error" in first) || first.unparsed || !fb.model || signal?.aborted) return first;
+  const via = [fb.provider, fb.model].filter(Boolean).join("/");
+  if (fb.model === config.llm.model && fb.provider === config.llm.provider) return first;
+  const second = await decideOnce({ ...config, llm: { ...config.llm, provider: fb.provider, model: fb.model, name: "" } }, items, signal, registry, sessionModel, sessionId);
+  if ("error" in second) return { ...second, error: `${first.error}; fallback ${via}: ${second.error}`, ms: first.ms + second.ms };
+  return { ...second, via, ms: first.ms + second.ms };
+}
+
+async function decideOnce(
   config: Config,
   items: TranscriptItem[],
   signal?: AbortSignal,
@@ -1233,7 +1263,14 @@ export default function (pi: ExtensionAPI, overrides: Partial<Config> = {}) {
   const piped = config.decider.includes("context");
   const inherited = process.env.PI_AUTOMODE_MODE;
   // A child Pi inherits its parent's guard, never yolo. An explicit override (tests, a host) wins.
-  const startMode: Mode = overrides.mode ?? (inherited === "safe" || inherited === "autonomous" ? inherited : config.enabled === false ? "yolo" : config.mode);
+  // Inside T3 Code (Pi instance env PI_AUTOMODE_T3=1, with the T3 automode bridge patch), T3's
+  // permission picker picks the mode: Auto → safe, Auto-accept edits → autonomous, Full access →
+  // yolo, Supervised → safe (T3 also asks for every tool there). Only the top-level Pi applies it:
+  // the owner marker stops a child Pi from inheriting yolo through T3's environment.
+  const t3Mode = process.env.PI_AUTOMODE_T3 === "1" && !process.env.PI_AUTOMODE_T3_OWNER ? process.env.T3_PI_RUNTIME_MODE : undefined;
+  const fromT3: Mode | undefined = t3Mode === "auto" || t3Mode === "approval-required" ? "safe" : t3Mode === "auto-accept-edits" ? "autonomous" : t3Mode === "full-access" ? "yolo" : undefined;
+  if (fromT3) process.env.PI_AUTOMODE_T3_OWNER = String(process.pid);
+  const startMode: Mode = overrides.mode ?? fromT3 ?? (inherited === "safe" || inherited === "autonomous" ? inherited : config.enabled === false ? "yolo" : config.mode);
   // The user's rules, plus the patterns saved with Always allow during this session. Without a
   // UI the withoutUi rules are added.
   const allowPatterns = [...config.rules.allow];
@@ -1347,6 +1384,7 @@ export default function (pi: ExtensionAPI, overrides: Partial<Config> = {}) {
       files,
       project: (p) => inCheckout(p, roots),
       chatDecider: config.decider.some((d) => TERMINAL.includes(d)),
+      trustedHosts: config.remote.trustedHosts,
     });
     let subject: string;
     let verdict: Verdict;
@@ -1584,7 +1622,7 @@ export default function (pi: ExtensionAPI, overrides: Partial<Config> = {}) {
         const action = items.at(-1);
         if (action && report?.facts.length) action.effects = report.facts;
         const decision = await decideWithLlm(config, items, ctx.signal, ctx.modelRegistry as unknown as ChatRegistry, ctx.model as unknown as Record<string, unknown>, sessionIdOf(ctx));
-        Object.assign(entry, { model: llmName(config.llm, ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined), llm: { stage: "stage" in decision ? decision.stage : undefined, tokens: "tokens" in decision ? decision.tokens : undefined } });
+        Object.assign(entry, { model: ("via" in decision && decision.via) || llmName(config.llm, ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined), llm: { stage: "stage" in decision ? decision.stage : undefined, tokens: "tokens" in decision ? decision.tokens : undefined } });
         if ("error" in decision) {
           entry.llmError = decision.error;
           opinion = { unavailable: decision.error };
@@ -1656,7 +1694,7 @@ export default function (pi: ExtensionAPI, overrides: Partial<Config> = {}) {
       const actionFiles = shown.length ? fileContents(shown) : undefined;
       const items = transcriptItems(branch, llm, { tool: event.toolName, input, id: event.toolCallId, files: actionFiles }, decided);
       const decision = await decideWithLlm(config, items, ctx.signal, ctx.modelRegistry as unknown as ChatRegistry, ctx.model as unknown as Record<string, unknown>, sessionIdOf(ctx));
-      Object.assign(entry, { model: llmName(llm, ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined), llm: { stage: "stage" in decision ? decision.stage : undefined, tokens: "tokens" in decision ? decision.tokens : undefined } });
+      Object.assign(entry, { model: ("via" in decision && decision.via) || llmName(llm, ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined), llm: { stage: "stage" in decision ? decision.stage : undefined, tokens: "tokens" in decision ? decision.tokens : undefined } });
 
       if ("error" in decision) {
         entry.llmError = decision.error;
