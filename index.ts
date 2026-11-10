@@ -37,7 +37,7 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { bashVerdict, commitWrites, compileRules, onlyTrustedSsh, setSecretPaths, fileVerdict, isRootLike, isSecretPath, makeScope, powershellVerdict, readVerdict, runTargets, within, type Action, type Scope, type SessionFiles, type Verdict } from "./rules.ts";
+import { bashVerdict, commitWrites, compileRules, onlyTrustedSsh, psAsBash, setSecretPaths, fileVerdict, isRootLike, isSecretPath, makeScope, powershellVerdict, readVerdict, runTargets, within, type Action, type Scope, type SessionFiles, type Verdict } from "./rules.ts";
 import { JUDGE_QUESTIONS, judgeState, redact, SHORT_REPLY } from "./context.ts";
 import { analyzeCode, analyzeFiles, analyzeText, changedFileReport, mergeReports, type AnalyzeOptions, type EffectReport, type Lang } from "./effects.ts";
 import { DEFAULT_JUDGE, guidelines, hashText, JEV_IDS, MODE_LABEL, MODES, namedEnough, needsUserWords, opinionCanClear, promptTitle, readJev, resolve, tierOf, unattendedDeny, type Facts, type JevRead, type JevScores, type JudgeConfig, type Mode, type SecondOpinion, type VerdictClass } from "./judge.ts";
@@ -1542,7 +1542,7 @@ export default function (pi: ExtensionAPI, overrides: Partial<Config> = {}) {
         measuredCode,
         complete: report?.complete ?? false,
         allowedKind: kindable(verdict) && sessionKinds.has(ruleReason),
-        trustedRemote: event.toolName === "bash" && onlyTrustedSsh(subject, scope),
+        trustedRemote: (event.toolName === "bash" ? onlyTrustedSsh(subject, scope) : event.toolName === "powershell" && onlyTrustedSsh(psAsBash(subject) ?? "", scope)),
         secrets: /credential/i.test(verdict.reason) || (report?.credentials.length ?? 0) > 0,
       };
       const unattended = mode === "autonomous" || (!ctx.hasUI && config.withoutUi.onAsk === "block");

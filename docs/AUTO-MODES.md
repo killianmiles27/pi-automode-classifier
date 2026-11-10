@@ -35,7 +35,7 @@ The important part is what a model **cannot** do, whatever it says:
 | Your own `ask` rules | Safe asks you; autonomous blocks |
 | Credential reads, root, downloaded code, Pi's files, `AGENTS.md` | Only with your own words **and** a second opinion that agrees |
 | Code measured as dangerous (a credential plus any network, obfuscated execution) | Only with your clear words **and** a second opinion |
-| Acting outside the project or on shared state (push, publish, ssh, outside writes, deletes, hard resets) | Only with your words. Looking like a sensible step of the task is not enough, except on a host you listed in `remote.trustedHosts`: there a clear step of your task ("ssh in and fix it") goes to the second opinion, which must agree |
+| Acting outside the project or on shared state (push, publish, ssh, outside writes, deletes, hard resets) | Only with your words. Looking like a sensible step of the task is not enough, except on a host you listed in `remote.trustedHosts`: there a clear step of your task ("ssh in and fix it") goes to the second opinion, which must agree. This holds for `ssh` from Bash and from a plain PowerShell line (Muse) |
 | Jev says suspicious at 60% or more and you did not name it | No second opinion can clear it |
 | You clearly named it (Jev 70% or more) but the command looks suspicious, such as `curl ... | sh` | The second opinion decides; a suspicious look no longer silences your words. Credential reads and exfiltration keep the veto |
 | You say "yes, do it" after a block | The call gets a fresh review: a remembered block holds only until your next message |
