@@ -52,6 +52,12 @@
   "allowedPaths": [],
   // More files or directories that count as this extension's own: changes to them always ask.
   "guardedPaths": [],
+  // ssh hosts you trust: an alias from ~/.ssh/config, a host name, an address or user@host.
+  // `ssh <host> '<command>'` there runs when the command only reads (ls, find, df, cat, docker ps,
+  // systemctl status); sudo in front of a read-only command goes to the judges; a change, a script
+  // or an interactive login still needs your words. Unusual ssh options (forwarding, ProxyCommand,
+  // -F) and every other host keep the usual ask.
+  "remote": { "trustedHosts": [] },
 
   // When there is no UI to show a prompt (print mode, most subagents).
   "withoutUi": {
@@ -84,6 +90,9 @@
     // empty: the session's own model.
     "provider": "",
     "model": "",
+    // Tried once, with the same settings, when the model above gives no answer (down, overloaded,
+    // timed out). Empty model: no fallback. A model that answered is never replaced.
+    "fallback": { "provider": "", "model": "" },
     // Name in the log and in `/automode-classifier status`. Empty: the model id.
     "name": "",
     // Override the Pi catalog entry. 0 keeps the catalog value.

@@ -207,6 +207,7 @@ export function guidelines(mode: Mode): string[] {
   const common = [
     "Auto mode reviews each bash call by what it does. Prefer a named project-local script over long inline code, keep scratch files inside the project rather than the system temp directory, and do not print the environment.",
     "Keep test results honest: when piping a test command through a filter, use `set -o pipefail` or run it directly so a failure is not hidden.",
+    "For remote work, call `ssh <host> '<command>'` directly, using a Host alias from ~/.ssh/config: never through a shell variable, function or wrapper script, which hides the command from review. Keep read-only inspection (ls, find, cat, df, docker ps, systemctl status, journalctl) in its own ssh calls, separate from changes: reads on a trusted host run without review, while a change is reviewed on its own.",
   ];
   if (mode === "safe") return common;
   return [

@@ -161,6 +161,15 @@ export interface Scope {
   vars?: Map<string, string>;
   // Variables of a `for` loop over literal words, so they only ever hold one of those words.
   loopVars?: Set<string>;
+  // Hosts you trust for read-only ssh (`remote.trustedHosts`): a command run there that the
+  // rules would allow here, reading and nothing else, runs without a judge.
+  trustedHosts?: string[];
+  // Set while checking the command an ssh call runs on a trusted host. Its paths are that host's,
+  // so they are never inside the project and never mapped onto this machine's files.
+  remote?: boolean;
+  // Set for the second pass over that command: sudo in front of a read-only command is allowed
+  // here, and the ssh call goes to the judges instead of needing your own words.
+  remoteRoot?: boolean;
 }
 
 const expandHome = (p: string) => (p === "~" || p.startsWith("~/") ? HOME + p.slice(1) : p);
@@ -174,6 +183,7 @@ export interface ScopeOptions {
   files?: SessionFiles;
   project?: (p: string) => boolean;
   chatDecider?: boolean;
+  trustedHosts?: string[];
 }
 
 export function makeScope(cwd: string, guarded: string[], options: ScopeOptions = {}): Scope {
@@ -190,6 +200,7 @@ export function makeScope(cwd: string, guarded: string[], options: ScopeOptions 
     pending: new Map(),
     project: options.project,
     chatDecider: options.chatDecider,
+    trustedHosts: options.trustedHosts?.map((h) => h.trim().toLowerCase()).filter(Boolean),
   };
 }
 
@@ -258,6 +269,12 @@ const expandVars = (word: string, scope: Scope) => word.replace(/\$\{(\w+)\}|\$(
 function resolveWord(word: string, scope: Scope): string | undefined {
   word = expandVars(word, scope);
   if (/[$`]/.test(word)) return undefined;
+  if (scope.remote) {
+    // A path on the remote host. `~` stands for its home, so ~/.ssh/id_rsa still reads as a key.
+    if (word === "~" || word.startsWith("~/")) word = REMOTE_HOME + word.slice(1);
+    else if (word.startsWith("~")) return undefined;
+    return path.posix.isAbsolute(word) ? path.posix.normalize(word) : undefined;
+  }
   if (process.platform === "win32") {
     // Git Bash drive paths refer to Windows files, not a folder on the current drive.
     word = shellPath(word);
@@ -952,6 +969,58 @@ const ALWAYS_ASK: Record<string, string> = {
   zypper: "changes system packages", snap: "changes system packages", flatpak: "changes system packages", brew: "changes system packages",
   twine: "uploads a package", fdisk: "edits disk partitions", parted: "edits disk partitions", sgdisk: "edits disk partitions",
 };
+
+// ---- ssh to a host you trust ----
+//
+// `ssh <trusted host> '<command>'` is checked as that command, run on that host. What the rules
+// would allow here (reading: ls, find, df, cat, docker ps, systemctl status) runs. The same with
+// sudo in front goes to the judges on its merits. Anything else, a change, a script, a shell, an
+// interactive login, an untrusted host or an unusual ssh option, keeps the usual ask.
+const REMOTE_HOME = "/home/~remote";
+// Options that only tune the connection. Forwarding, proxies, local commands, control masters,
+// agent and X11 forwarding, log files and other config files are missing on purpose.
+const SSH_BARE_FLAGS = /^-[46CTtqvnxk]+$/;
+const SSH_VALUE_FLAGS = new Set(["i", "p", "l", "o", "c", "m"]);
+const SSH_SAFE_OPTIONS = new Set([
+  "batchmode", "connecttimeout", "connectionattempts", "stricthostkeychecking", "userknownhostsfile", "identityfile",
+  "identitiesonly", "port", "user", "serveraliveinterval", "serveralivecountmax", "loglevel", "requesttty", "compression",
+  "preferredauthentications", "passwordauthentication", "pubkeyauthentication", "numberofpasswordprompts", "tcpkeepalive",
+  "hostkeyalias", "checkhostip", "visualhostkey", "addressfamily", "ciphers", "macs", "kexalgorithms", "hostkeyalgorithms",
+]);
+// Project tools run code that the remote host's files decide, which nothing here has read.
+const REMOTE_RUNNER = /(?:^|[\s;&|(])(npm|pnpm|yarn|bun|npx|node|deno|make|just|ninja|cmake|pytest|tox|nox|cargo|go|uv|pip3?|python3?|ruby|perl|php|dotnet|mvn|gradle|gradlew|poetry|rake|bundle|ansible\S*)(?=[\s;&|)]|$)/;
+function trustedSsh(args: string[], scope: Scope, depth: number): Verdict | undefined {
+  let i = 0;
+  for (; i < args.length; i++) {
+    const a = args[i];
+    if (a === "--") { i++; break; }
+    if (!a.startsWith("-")) break;
+    if (SSH_BARE_FLAGS.test(a)) continue;
+    const flag = a[1];
+    if (!SSH_VALUE_FLAGS.has(flag)) return undefined;
+    const value = a.length > 2 ? a.slice(2) : args[++i];
+    if (value === undefined) return undefined;
+    if (flag === "o") {
+      const key = value.split(/[=\s]/)[0].toLowerCase();
+      if (!SSH_SAFE_OPTIONS.has(key)) return undefined;
+    }
+  }
+  const dest = args[i];
+  const rest = args.slice(i + 1);
+  if (!dest || !rest.length || /[$`*?{}[\]]/.test(dest)) return undefined;
+  const host = dest.replace(/^[^@]*@/, "").toLowerCase();
+  const hosts = scope.trustedHosts ?? [];
+  if (!hosts.includes(dest.toLowerCase()) && !hosts.includes(host)) return undefined;
+  // ssh joins its arguments with spaces and the remote shell parses the result.
+  const remote = rest.join(" ");
+  if (REMOTE_RUNNER.test(remote) || depth > 2) return undefined;
+  const there: Scope = { ...scope, cwd: undefined, root: undefined, guarded: [], piDirs: [], allowed: [], rules: undefined, picked: undefined, files: new Map(), pending: new Map(), project: undefined, vars: undefined, loopVars: undefined, remote: true };
+  const plain = evaluateParsed(parse(remote, depth + 1), there, depth + 1);
+  if (plain.action === "allow") return { action: "allow", reason: `reads only, on trusted host ${dest}` };
+  const asRoot = evaluateParsed(parse(remote, depth + 1), { ...there, remoteRoot: true }, depth + 1);
+  if (asRoot.action === "allow") return classify(`ssh ${dest} reads as root on a trusted host`);
+  return undefined;
+}
 
 // Commands that delete or overwrite the paths xargs feeds them from stdin.
 const DESTRUCTIVE_XARGS = new Set(["rm", "rmdir", "unlink", "mv", "chmod", "chown", "chgrp", "tee", "dd", "shred", "truncate", "patch"]);
@@ -2278,7 +2347,16 @@ function command(cmd: Simple, scope: Scope, depth: number): Verdict {
 
   if (name === "sudo" || name === "doas") {
     const inner = afterFlags(args, /^-[ugCDhpRrTU]$/);
+    // On a trusted host, root for a command that only reads. A shell, a login or an edit is never that.
+    if (scope.remoteRoot && inner.length && !args.some((a) => /^-[a-zA-Z]*[sieE]/.test(a) || /^--(shell|login|edit|preserve-env)/.test(a))) {
+      const v = simple({ argv: inner, out: [] }, scope, depth + 1);
+      if (v.action === "allow") return worst(verdict, v);
+    }
     return worst(verdict, criticalAsk(`${name} runs as root`), inner.length ? simple({ argv: inner, out: [] }, scope, depth + 1) : ALLOW);
+  }
+  if (name === "ssh" && scope.trustedHosts?.length && !scope.remote) {
+    const trusted = trustedSsh(args, scope, depth);
+    if (trusted) return worst(verdict, trusted);
   }
   if (ALWAYS_ASK[name]) return worst(verdict, (name === "su" || name === "pkexec" ? criticalAsk : ask)(`${name} ${ALWAYS_ASK[name]}`));
   if (args.length === 1 && /^(--version|-V|--help|-h)$/.test(args[0])) return verdict;
@@ -2494,6 +2572,13 @@ const FORK_BOMB = /:\(\)\s*\{\s*:\s*\|\s*:\s*&\s*\}\s*;\s*:/;
 // A download piped into a shell, or into an interpreter that reads its program from stdin.
 // `curl ... | python3 -c "..."` is not one: the download is the program's input.
 const PIPE_TO_SHELL = /\b(curl|wget)\b[^|;&\n]*\|\s*(sudo\s+)?(env\s+)?(ba|z|da|k)?sh\b|\b(curl|wget)\b[^|;&\n]*\|\s*(python3?|node|perl|ruby)\s*(-\s*)?($|[|;&\n)])/;
+// An ssh call next to a shell or interpreter on this machine may feed it what the remote host
+// sends, which nothing here has read. The trusted-host fast path does not apply then.
+const LOCAL_RUNNERS = /^(ba|z|da|k|fi)?sh$|^(python[\d.]*|node|perl|ruby|pwsh|powershell|eval|source|\.|xargs)$/;
+function sshFeedsLocalCode(parsed: Parsed): boolean {
+  const names = parsed.cmds.map((c) => path.basename(unwrap(c.argv)[0] ?? ""));
+  return names.includes("ssh") && names.some((n) => LOCAL_RUNNERS.test(n));
+}
 
 // `NAME=value` words of a command that only sets variables (or exports them).
 function assignments(argv: string[]): [string, string][] | undefined {
@@ -2556,7 +2641,9 @@ function mentionsGuarded(text: string, scope: Scope): string | undefined {
 
 export function bashVerdict(command: string, scope: Scope): Verdict {
   if (FORK_BOMB.test(command)) return deny("fork bomb");
-  const verdict = evaluateParsed(parse(command), scope, 0);
+  const parsed = parse(command);
+  const trusting = !!scope.trustedHosts?.length && sshFeedsLocalCode(parsed);
+  const verdict = evaluateParsed(parsed, trusting ? { ...scope, trustedHosts: undefined } : scope, 0);
   if (verdict.action === "deny") return verdict;
   const named = verdict.action === "classify" && mentionsGuarded(command, scope);
   const guarded = named ? worst(verdict, guardAsk(`code that names the auto-mode guard's own files: ${named}`)) : verdict;
