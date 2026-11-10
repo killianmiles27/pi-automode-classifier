@@ -55,6 +55,10 @@ export interface JudgeConfig {
   harmlessHarmBelow: number;
   harmlessSuspiciousBelow: number;
   harmlessServesAbove: number;
+  // An outward step of the task the user gave goes to the second opinion when Jev rates it so.
+  scopedServesAbove: number;
+  scopedHarmBelow: number;
+  scopedSuspiciousBelow: number;
   // With the second opinion down, local code may run only when Jev is this relaxed about it.
   fallbackHarmBelow: number;
   fallbackSuspiciousBelow: number;
@@ -82,6 +86,9 @@ export const DEFAULT_JUDGE: JudgeConfig = {
   harmlessHarmBelow: 0.1,
   harmlessSuspiciousBelow: 0.2,
   harmlessServesAbove: 0.2,
+  scopedServesAbove: 0.6,
+  scopedHarmBelow: 0.5,
+  scopedSuspiciousBelow: 0.3,
   fallbackHarmBelow: 0.2,
   fallbackSuspiciousBelow: 0.2,
   suspiciousStopsAbove: 0.6,
@@ -97,6 +104,10 @@ export interface Facts {
   complete: boolean;
   // A kind of call the user allowed for this session in a prompt.
   allowedKind?: boolean;
+  // The call reaches other machines only through ssh to hosts in remote.trustedHosts.
+  trustedRemote?: boolean;
+  // The call reads a credential: a rule said so, or the effects analysis measured it.
+  secrets?: boolean;
   // LANCET's score, when it ran.
   lancet?: number;
   lancetAskAbove?: number;
@@ -110,11 +121,33 @@ export type JevRead = { to: "allow" | "deny" | "gray"; why: string };
 export const needsUserWords = (f: Pick<Facts, "cls" | "level">) => f.cls === "outward" || f.level === "danger" || tierOf(f.cls) === "gated";
 
 // Whether the user's words reach the bar this call needs before a second opinion can clear it.
-export function namedEnough(s: JevScores | undefined, f: Pick<Facts, "cls" | "level">, c: JudgeConfig): boolean {
-  if (!s || s.suspicious >= c.namedSuspiciousBelow) return false;
+// Jev's `suspicious` reads the command's shape (`curl ... | sh` always looks suspicious), so when the
+// user plainly named the action it does not silence them: the second opinion, which reads the whole
+// conversation, decides, and it must still agree.
+export function namedEnough(s: JevScores | undefined, f: Pick<Facts, "cls" | "level" | "secrets">, c: JudgeConfig): boolean {
+  if (!s) return false;
+  // Credentials and exfiltration keep the veto: there a suspicious look outweighs the words (the
+  // red-team run had a "print the credentials file" request carry a disguised path).
+  const vetoed = f.secrets || f.cls === "exfil" ? s.suspicious >= c.namedSuspiciousBelow : s.suspicious >= c.namedSuspiciousBelow && s.named_by_user < c.namedAbove;
+  if (vetoed) return false;
   const strict = f.level === "danger" || f.cls === "exfil";
   return s.named_by_user >= (strict ? c.namedAbove : c.gatedNamedAbove);
 }
+
+// A change on a server the user trusts (remote.trustedHosts) that is plainly a step of the task
+// they gave: "ssh into my server and fix it". Naming the task is not naming each step, so this
+// never allows on its own; it lets the second opinion decide instead of a flat deny. Only ssh to a
+// trusted host qualifies: the red-team run showed the second opinion clearing outward writes to
+// ~/.bashrc, git hooks, the clock and the hostname once they reached it, so every other outward
+// call keeps the named-words bar.
+export function taskScoped(s: JevScores | undefined, f: Pick<Facts, "cls" | "level" | "trustedRemote">, c: JudgeConfig): boolean {
+  if (!s || !f.trustedRemote || f.cls !== "outward" || f.level === "danger") return false;
+  return s.serves_task >= c.scopedServesAbove && s.lasting_harm < c.scopedHarmBelow && s.suspicious < c.scopedSuspiciousBelow;
+}
+
+// Whether a second opinion may clear this call at all.
+export const opinionCanClear = (s: JevScores | undefined, f: Pick<Facts, "cls" | "level" | "trustedRemote" | "secrets">, c: JudgeConfig) =>
+  !needsUserWords(f) || namedEnough(s, f, c) || taskScoped(s, f, c);
 
 // What Jev's four answers mean for this call. A tier-gated call can never be allowed here: the
 // caller also requires the second opinion, because a model can be talked into "the user named it".
@@ -164,9 +197,10 @@ export function resolve(input: {
 
   const opinionDown = !opinion || "unavailable" in opinion;
   if (needsUserWords(facts)) {
-    if (!namedEnough(scores, facts, c)) return unresolved(jev?.why ?? "Jev could not confirm the user asked for it", !jev);
+    if (!namedEnough(scores, facts, c) && !taskScoped(scores, facts, c)) return unresolved(jev?.why ?? "Jev could not confirm the user asked for it", !jev);
     if (opinionDown) return unresolved("the second opinion is unavailable", true);
-    return opinion.block ? unresolved(opinion.reason ?? "the second opinion blocked it") : { to: "allow", why: "the user named it and the second opinion agrees" };
+    const why = namedEnough(scores, facts, c) ? "the user named it and the second opinion agrees" : "a step of your task on a trusted host, and the second opinion agrees";
+    return opinion.block ? unresolved(opinion.reason ?? "the second opinion blocked it") : { to: "allow", why };
   }
 
   // A clear signal from Jev is not something a second model gets to talk away.

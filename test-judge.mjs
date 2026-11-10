@@ -36,6 +36,34 @@ t("an outward call nobody named does not run, however sensible it looks", () => 
   assert.equal(go("autonomous", f("outward", "local"), s(.95, .1, .1, .05), allow).to, "deny");
   assert.equal(go("safe", f("outward", "local"), s(.95, .1, .1, .05), allow).to, "ask");
 });
+const trusted = { trustedRemote: true };
+t("a step of the task on a trusted host goes to the second opinion, which must agree", () => {
+  assert.equal(go("autonomous", f("outward", "review", trusted), s(.95, .1, .1, .05), allow).to, "allow");
+  assert.equal(go("autonomous", f("outward", "review", trusted), s(.95, .1, .1, .05), block).to, "deny");
+  assert.equal(go("safe", f("outward", "review", trusted), s(.95, .1, .1, .05), block).to, "ask");
+  assert.equal(go("autonomous", f("outward", "review", trusted), s(.95, .1, .1, .05), down).to, "deny");
+});
+t("on a trusted host, off-task, harmful or suspicious steps do not reach the second opinion", () => {
+  for (const sc of [s(.4, .1, .1, .05), s(.95, .1, .6, .05), s(.95, .1, .1, .4)]) assert.equal(go("autonomous", f("outward", "review", trusted), sc, allow).to, "deny");
+});
+t("the trusted-host path never covers danger, credentials, exfil or root", () => {
+  assert.equal(go("autonomous", f("outward", "danger", trusted), s(.95, .1, .1, .05), allow).to, "deny");
+  for (const cls of ["exfil", "critical", "firm"]) assert.equal(go("autonomous", f(cls, "review", trusted), s(.95, .1, .1, .05), allow).to, "deny");
+});
+t("the user's clear words are not silenced by a suspicious-looking command, but the second opinion decides", () => {
+  assert.equal(go("autonomous", f("opaque", "danger", code), s(.9, .83, .84, .8), allow).to, "allow");
+  assert.equal(go("autonomous", f("opaque", "danger", code), s(.9, .83, .84, .8), block).to, "deny");
+  assert.equal(go("autonomous", f("opaque", "danger", code), s(.9, .6, .84, .8), allow).to, "deny");
+});
+t("for credentials and exfil a suspicious look still vetoes the user's words", () => {
+  assert.equal(go("autonomous", f("exfil"), s(.9, .8, .3, .72), allow).to, "deny");
+  assert.equal(go("autonomous", f("critical", "review", { secrets: true }), s(.9, .8, .3, .72), allow).to, "deny");
+});
+t("root or downloaded code the user clearly asked for goes to the second opinion despite a suspicious look", () => {
+  assert.equal(go("autonomous", f("critical"), s(.9, .89, .77, .75), allow).to, "allow");
+  assert.equal(go("autonomous", f("critical"), s(.9, .89, .77, .75), block).to, "deny");
+  assert.equal(go("autonomous", f("critical"), s(.9, .6, .3, .75), allow).to, "deny");
+});
 t("an outward call partly named goes to the second opinion", () => {
   assert.equal(go("autonomous", f("outward"), s(.9, .5, .3, .05), allow).to, "allow");
   assert.equal(go("autonomous", f("outward"), s(.9, .5, .3, .05), block).to, "deny");

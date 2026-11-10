@@ -37,10 +37,10 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { bashVerdict, commitWrites, compileRules, setSecretPaths, fileVerdict, isRootLike, isSecretPath, makeScope, powershellVerdict, readVerdict, runTargets, within, type Action, type Scope, type SessionFiles, type Verdict } from "./rules.ts";
+import { bashVerdict, commitWrites, compileRules, onlyTrustedSsh, setSecretPaths, fileVerdict, isRootLike, isSecretPath, makeScope, powershellVerdict, readVerdict, runTargets, within, type Action, type Scope, type SessionFiles, type Verdict } from "./rules.ts";
 import { JUDGE_QUESTIONS, judgeState, redact, SHORT_REPLY } from "./context.ts";
 import { analyzeCode, analyzeFiles, analyzeText, changedFileReport, mergeReports, type AnalyzeOptions, type EffectReport, type Lang } from "./effects.ts";
-import { DEFAULT_JUDGE, guidelines, hashText, JEV_IDS, MODE_LABEL, MODES, namedEnough, needsUserWords, promptTitle, readJev, resolve, tierOf, unattendedDeny, type Facts, type JevRead, type JevScores, type JudgeConfig, type Mode, type SecondOpinion, type VerdictClass } from "./judge.ts";
+import { DEFAULT_JUDGE, guidelines, hashText, JEV_IDS, MODE_LABEL, MODES, namedEnough, needsUserWords, opinionCanClear, promptTitle, readJev, resolve, tierOf, unattendedDeny, type Facts, type JevRead, type JevScores, type JudgeConfig, type Mode, type SecondOpinion, type VerdictClass } from "./judge.ts";
 import { buildSystemPrompt, buildTranscript, denyMessage, mergeRules, parseVerdict, STAGE1_INSTRUCTION, stage2Instruction, DEFAULT_RULES, DEFAULT_LLM, type LlmConfig, type Outcome, type TranscriptItem } from "./automode.ts";
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -264,6 +264,7 @@ const SCHEMA: Schema = {
     namedAbove: isThreshold, namedSuspiciousBelow: isThreshold, gatedNamedAbove: isThreshold,
     stepServesAbove: isThreshold, stepHarmBelow: isThreshold, stepSuspiciousBelow: isThreshold,
     harmlessHarmBelow: isThreshold, harmlessSuspiciousBelow: isThreshold, harmlessServesAbove: isThreshold,
+    scopedServesAbove: isThreshold, scopedHarmBelow: isThreshold, scopedSuspiciousBelow: isThreshold,
     fallbackHarmBelow: isThreshold, fallbackSuspiciousBelow: isThreshold, suspiciousStopsAbove: isThreshold,
     wrapUpAfterBlocks: atLeast(1),
   },
@@ -1202,8 +1203,20 @@ function changedSince(base: string | undefined, cwd: string): string[] {
   const out = [...(base ? (git(cwd, "diff", "--name-only", "--relative", base) ?? "").split("\n") : []), ...(git(cwd, "ls-files", "--others", "--exclude-standard") ?? "").split("\n")];
   return out.filter(Boolean).slice(0, 200).map((p) => path.resolve(cwd, p));
 }
+// Whether a command starts a project runner. Quoted text is an argument, not a command (a message
+// that mentions "cargo test" runs nothing), and `cargo --version` runs no project code.
+export function startsRunner(command: string): boolean {
+  const bare = command.replace(/'[^']*'|"(?:[^"\\]|\\.)*"/g, '""');
+  const runner = new RegExp(RUNNER.source, "g");
+  for (const m of bare.matchAll(runner)) {
+    const next = bare.slice((m.index ?? 0) + m[0].length).trimStart().split(/[\s;&|)]/)[0];
+    if (!/^(--version|-V|--help|-h)$/.test(next)) return true;
+  }
+  return false;
+}
+
 export function runnerReport(command: string, cwd: string, base: string | undefined, opts: AnalyzeOptions): EffectReport | undefined {
-  const runs = RUNNER.test(command);
+  const runs = startsRunner(command);
   if (!runs) return undefined;
   const scripts = npmScripts(command, cwd);
   const text = scripts.join("\n");
@@ -1255,6 +1268,16 @@ function boundedContents(paths: string[]): Record<string, string> {
 const fullAction = (subject: string, files: string[]) =>
   [subject, ...Object.entries(fileContents(files)).map(([p, text]) => `\n----- ${p} -----\n${redact(text).text}`)].join("\n");
 
+// A hash of the user's most recent message on this branch, or "" when there is none.
+function latestUserHash(ctx: { sessionManager?: { getBranch?: () => unknown[] } }): string {
+  const branch = (ctx.sessionManager?.getBranch?.() ?? []) as { message?: Record<string, unknown> }[];
+  for (let i = branch.length - 1; i >= 0; i--) {
+    const m = branch[i]?.message;
+    if (m?.role === "user") return hashText(JSON.stringify(m.content ?? ""));
+  }
+  return "";
+}
+
 export default function (pi: ExtensionAPI, overrides: Partial<Config> = {}) {
   const loaded = loadConfig();
   // Nested blocks merge, so a caller can set one threshold without restating the rest.
@@ -1302,6 +1325,9 @@ export default function (pi: ExtensionAPI, overrides: Partial<Config> = {}) {
   const memory = new Map<string, "allow" | "deny">();
   const sessionBase = new Map<string, string | undefined>();
   const lastDeny = new Map<string, string>();
+  // The user's latest message when a call was denied. A remembered deny holds only until the user
+  // says something new: "yes, do it" after a block is a fresh request, and gets a fresh review.
+  const deniedUnder = new Map<string, string>();
   // What autonomous held back, for the user to review when they come back.
   const blockedCalls: { tool: string; subject: string; reason: string }[] = [];
   let reportedBlocks = 0;
@@ -1516,6 +1542,8 @@ export default function (pi: ExtensionAPI, overrides: Partial<Config> = {}) {
         measuredCode,
         complete: report?.complete ?? false,
         allowedKind: kindable(verdict) && sessionKinds.has(ruleReason),
+        trustedRemote: event.toolName === "bash" && onlyTrustedSsh(subject, scope),
+        secrets: /credential/i.test(verdict.reason) || (report?.credentials.length ?? 0) > 0,
       };
       const unattended = mode === "autonomous" || (!ctx.hasUI && config.withoutUi.onAsk === "block");
       const myAskRule = verdict.reason.startsWith("your ask rule");
@@ -1529,7 +1557,8 @@ export default function (pi: ExtensionAPI, overrides: Partial<Config> = {}) {
         finish("allow", "memory");
         return undefined;
       }
-      if (memo === "deny" && unattended) {
+      const userNow = latestUserHash(ctx);
+      if (memo === "deny" && unattended && deniedUnder.get(key) === userNow) {
         counts.blocked++;
         held("automode-blocked");
         blockStreak++;
@@ -1613,8 +1642,7 @@ export default function (pi: ExtensionAPI, overrides: Partial<Config> = {}) {
 
       // A second opinion only where it can change the outcome: gray, and for a gated or dangerous
       // call only when the user named it.
-      const gated = needsUserWords(effective);
-      const wantOpinion = tier !== "locked" && tier !== "hard" && jev?.to !== "allow" && jev?.to !== "deny" && (!gated || namedEnough(scores, effective, config.judge));
+      const wantOpinion = tier !== "locked" && tier !== "hard" && jev?.to !== "allow" && jev?.to !== "deny" && opinionCanClear(scores, effective, config.judge);
       let opinion: SecondOpinion | undefined;
       if (wantOpinion && config.judge.secondOpinion) {
         const shown = viewFiles.length ? boundedContents(viewFiles) : undefined;
@@ -1648,6 +1676,7 @@ export default function (pi: ExtensionAPI, overrides: Partial<Config> = {}) {
         if (!final.retryable) {
           memory.set(key, "deny");
           lastDeny.set(key, final.why);
+          deniedUnder.set(key, userNow);
         }
         blockedCalls.push({ tool: event.toolName, subject: clip(subject, 300), reason: final.why });
         finish("block", final.retryable ? "unavailable" : "judges");

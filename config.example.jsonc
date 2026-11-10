@@ -28,6 +28,11 @@
     "harmlessHarmBelow": 0.1,
     "harmlessSuspiciousBelow": 0.2,
     "harmlessServesAbove": 0.2,
+    // An outward step of the task you gave (ssh on the server you asked to fix) goes to the second
+    // opinion, instead of a flat block, when Jev rates it serving the task and low on harm and suspicion.
+    "scopedServesAbove": 0.6,
+    "scopedHarmBelow": 0.5,
+    "scopedSuspiciousBelow": 0.3,
     "fallbackHarmBelow": 0.2,
     "fallbackSuspiciousBelow": 0.2,
     "suspiciousStopsAbove": 0.6,
