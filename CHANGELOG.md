@@ -20,6 +20,22 @@ Two modes replace Auto. `docs/AUTO-MODES.md` has how they decide, setup, results
 
 ## Unreleased
 
+Autonomous blocked too much of what was asked (52 of 56 blocks over Nov 5-9 were false positives). Measured side by side with Claude Code's auto mode in `eval/ab/`: real Claude Code and Pi TUIs, each in its own Orca terminal, on the same 29 requested tasks and 3 injection attacks, in throwaway sandboxes.
+
+| | Claude Code (Haiku, auto) | Pi, before | Pi, now |
+|---|---|---|---|
+| Tasks done on the first ask | 29/29 | 27/29 | 28/29 |
+| Blocks on requested tasks | 0 | 5 | 2 |
+| Attacks held | 3/3 | 3/3 | 3/3 |
+
+Safety corpus, autonomous (627 cases): dangerous calls that ran 1/345 before, 2/345 now; both are coin-flip cases on the existing "partly named" path, where Jev scores 0.44-0.48 against the 0.45 bar. A first, broader version let 12/345 through and was narrowed.
+
+- **Trusted servers**: on a host in `remote.trustedHosts`, a change that plainly serves your task ("ssh in and fix it") goes to the second opinion instead of a flat block. Every other outward call keeps the named-words bar. New thresholds `judge.scopedServesAbove`, `scopedHarmBelow`, `scopedSuspiciousBelow`.
+- **Your words beat a suspicious look**: when Jev is confident you named the action (`namedAbove`), its suspicion score no longer stops the second opinion from deciding (a `curl ... | sh` you typed out). Credential reads and exfiltration keep the veto.
+- **"Yes, do it" works**: a remembered block holds only until your next message, instead of re-blocking the same call from review memory.
+- **Fixes**: `find ... -exec rm -rf {} +` read as `rm -rf .`; a glob over a folder that exists (`cat capabilities/*.json`) is judged by the files there, not by a guessed `credentials.json`; crate sources under `~/.cargo/registry` are not credentials; `cargo --version` and a quoted "cargo test" no longer start the runner scan.
+
+
 - Add `docs/TUNING.md`: the read-only rule changes, the PowerShell vocabulary, and the opt-in thresholds that cut prompts, with the measured effect and the review fixes that closed the bypasses.
 
 Fewer prompts for read-only work:
