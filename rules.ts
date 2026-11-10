@@ -3114,7 +3114,13 @@ export function powershellVerdict(command: string, _scope?: Scope): Verdict {
       return criticalAsk(`PowerShell runs ${word} (${canonical})`);
     }
   }
-  for (const piece of bare.split(/\n|;|\|/)) {
+  // The same pieces cut from the original text, quotes intact, when both cuts agree.
+  const barePieces = bare.split(/\n|;|\|/);
+  const quoted = psSplit(text);
+  const aligned = quoted && quoted.length === barePieces.length ? quoted : undefined;
+  let pieceAt = -1;
+  for (const piece of barePieces) {
+    pieceAt++;
     // Strip an assignment, then skip the pieces that are not a command: a hashtable entry, a
     // subexpression, a continuation of a block, a comment or a bare string. A bare variable is
     // a read ("$env:PATH" prints it) and a validated local writer is allowed with its write.
@@ -3127,8 +3133,8 @@ export function powershellVerdict(command: string, _scope?: Scope): Verdict {
     // A native program (git, npm, node), not a cmdlet: the shell rules know what these do. Only a
     // plain line, since PowerShell syntax in it would be misread as bash.
     if (_scope && !/^[a-z]+-[a-z]/.test(word)) {
-      const original = text.split(/\n|;|\|/).map((p) => p.trim()).find((p) => p.toLowerCase().startsWith(word));
-      if (original && !/[$@(){}`]/.test(original)) {
+      const original = aligned ? aligned[pieceAt]?.trim() : text.split(/\n|;|\|/).map((p) => p.trim()).find((p) => p.toLowerCase().startsWith(word));
+      if (original && (aligned ? psPlainNative(original) : !/[$@(){}`]/.test(original))) {
         const native = bashVerdict(original, _scope);
         if (native.action === "allow") continue;
         return native;
@@ -3137,6 +3143,61 @@ export function powershellVerdict(command: string, _scope?: Scope): Verdict {
     return ask(`PowerShell ${word} needs review`);
   }
   return worst(readVerdict ?? ALLOW, ALLOW);
+}
+
+// PowerShell text cut at `;`, `|` and newlines outside quotes, or undefined when a quote is left
+// open. Inside '…' a doubled '' is a quote; inside "…" a backtick escapes the next character.
+function psSplit(text: string): string[] | undefined {
+  const pieces: string[] = [];
+  let quote = "", start = 0;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (quote === "'") {
+      if (c === "'") { if (text[i + 1] === "'") i++; else quote = ""; }
+    } else if (quote === '"') {
+      if (c === "`") i++;
+      else if (c === '"') quote = "";
+    } else if (c === "'" || c === '"') quote = c;
+    else if (c === ";" || c === "|" || c === "\n") {
+      pieces.push(text.slice(start, i));
+      start = i + 1;
+    }
+  }
+  if (quote) return undefined;
+  pieces.push(text.slice(start));
+  return pieces;
+}
+
+// A native program line whose words a Bash parse reads the same way PowerShell passes them:
+// single-quoted text is literal in both. What PowerShell would expand or Windows PowerShell 5.1
+// would re-quote differently is refused: `$`, `@`, `(`, `{`, a backtick outside single quotes, a
+// double quote or a '' inside them, an empty argument, a backslash before a closing quote.
+function psPlainNative(line: string): boolean {
+  let outside = "";
+  for (let i = 0; i < line.length; i++) {
+    if (line[i] !== "'") { outside += line[i]; continue; }
+    const end = line.indexOf("'", i + 1);
+    if (end < 0) return false;
+    const inner = line.slice(i + 1, end);
+    if (!inner || inner.includes('"') || line[end + 1] === "'" || inner.endsWith("\\")) return false;
+    outside += "''";
+    i = end;
+  }
+  return !/[$@(){}`]/.test(outside) && !/""|\\"/.test(outside);
+}
+
+/** A PowerShell command as the Bash text it is equivalent to, when it is only plain native
+ * program lines (`ssh killian 'ls /srv'`, `git status`), else undefined. */
+export function psAsBash(command: string): string | undefined {
+  const text = command.replace(/\r/g, "");
+  const pieces = psSplit(text);
+  if (!pieces) return undefined;
+  for (const piece of pieces) {
+    const line = piece.trim();
+    if (!line) continue;
+    if (/^[a-z]+-[a-z]/i.test(line) || !psPlainNative(line)) return undefined;
+  }
+  return text;
 }
 
 // ---- scripts and inline programs a command runs ----
