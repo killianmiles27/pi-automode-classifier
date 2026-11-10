@@ -456,6 +456,26 @@ function globNamesWellKnownSecret(glob: string): boolean {
     }
   });
 }
+// What a glob with wildcards only in its last part matches right now, when its directory exists
+// and is not itself a credential place: `capabilities/*.json` is the files that are there, not a
+// guessed credentials.json. Undefined when the directory cannot be listed, so guessing takes over.
+function globOnDisk(glob: string): string[] | undefined {
+  const dir = path.posix.dirname(glob);
+  const base = path.posix.basename(glob);
+  if (!(path.posix.isAbsolute(dir) || /^[a-z]:\//i.test(dir)) || /[?*[\]]/.test(dir) || !/[?*[]/.test(base)) return undefined;
+  // A hostile word can carry thousands of wildcards; such a word is guessed at, not compiled.
+  if (base.length > 200 || (base.match(/[?*[]/g) ?? []).length > 8) return undefined;
+  if (SECRET_PLACES.some((place) => place.test(dir + "/x"))) return undefined;
+  let names: string[];
+  try {
+    names = fs.readdirSync(process.platform === "win32" ? dir.replace(/^\/([a-z])\//i, "$1:/") : dir);
+  } catch {
+    return undefined;
+  }
+  const re = new RegExp(`^${base.replace(/[.+^${}()|\\]/g, "\\$&").replace(/\*/g, ".*").replace(/\?/g, ".").replace(/\[!/g, "[^")}$`, process.platform === "win32" ? "i" : "");
+  return names.filter((n) => re.test(n)).map((n) => `${dir}/${n}`);
+}
+
 function globFill(word: string): string[] {
   const stars = ["", "n", "x", "json", "yml", "yaml", "pem", "key", "rsa", "ed25519", "credentials", "config", "auth"];
   const ones = ["n", "m", "l", "x", "1", "a", "s", "e", "r", "t", "o", "u"];
@@ -487,6 +507,8 @@ export function isSecretPath(p: string): boolean {
     if (globNamesWellKnownSecret(p)) return true;
     // Past this many wildcards, filling them in cannot finish and the word is rarely a path at all.
     if ((p.match(/[?*\[]/g) ?? []).length > 3) return false;
+    const onDisk = globOnDisk(p);
+    if (onDisk) return onDisk.some(isSecretPath);
     return globFill(p).some(isSecretPath);
   }
   if (process.platform === "win32") p = p.toLowerCase();
@@ -505,7 +527,8 @@ const CREDENTIAL_DIRS = [
   /\/\.(ssh|aws|gnupg|kube|azure|oci|password-store)(\/|$)/,
   /\/\.config\/(gcloud|op|gh)(\/|$)/,
   /\/\.docker(\/|$)/,
-  /\/\.cargo(\/|$)/,
+  // ~/.cargo itself, not the crate sources under registry/ and git/, which are public code.
+  /\/\.cargo(\/(?!registry\/|git\/)|$)/,
   /\/\.terraform\.d(\/|$)/,
   /\/\.pi\/agent(\/|$)/,
   /\/\.(codex|claude)(\/|$)/,
@@ -588,6 +611,12 @@ function secretIn(word: string, scope: Scope, isPath = false): string | undefine
     for (const candidate of new Set([expanded, expanded.slice(expanded.lastIndexOf(":") + 1)])) {
       if (!candidate || candidate.startsWith("-")) continue;
       const p = resolveWord(candidate, scope);
+      // A glob over a folder that exists is judged by what it matches there.
+      const onDisk = p && /[?*[]/.test(candidate) ? globOnDisk(slash(p)) : undefined;
+      if (onDisk) {
+        if (onDisk.some(isSecretPath)) return candidate;
+        continue;
+      }
       if (isSecretPath(expandHome(candidate)) || (p && isSecretPath(p))) return candidate;
     }
   }
@@ -989,7 +1018,9 @@ const SSH_SAFE_OPTIONS = new Set([
 ]);
 // Project tools run code that the remote host's files decide, which nothing here has read.
 const REMOTE_RUNNER = /(?:^|[\s;&|(])(npm|pnpm|yarn|bun|npx|node|deno|make|just|ninja|cmake|pytest|tox|nox|cargo|go|uv|pip3?|python3?|ruby|perl|php|dotnet|mvn|gradle|gradlew|poetry|rake|bundle|ansible\S*)(?=[\s;&|)]|$)/;
-function trustedSsh(args: string[], scope: Scope, depth: number): Verdict | undefined {
+// The destination and remote command of an ssh call to a trusted host using only plain options,
+// or undefined for any other ssh call.
+function trustedTarget(args: string[], scope: Scope): { dest: string; rest: string[] } | undefined {
   let i = 0;
   for (; i < args.length; i++) {
     const a = args[i];
@@ -1011,6 +1042,13 @@ function trustedSsh(args: string[], scope: Scope, depth: number): Verdict | unde
   const host = dest.replace(/^[^@]*@/, "").toLowerCase();
   const hosts = scope.trustedHosts ?? [];
   if (!hosts.includes(dest.toLowerCase()) && !hosts.includes(host)) return undefined;
+  return { dest, rest };
+}
+
+function trustedSsh(args: string[], scope: Scope, depth: number): Verdict | undefined {
+  const target = trustedTarget(args, scope);
+  if (!target) return undefined;
+  const { dest, rest } = target;
   // ssh joins its arguments with spaces and the remote shell parses the result.
   const remote = rest.join(" ");
   if (REMOTE_RUNNER.test(remote) || depth > 2) return undefined;
@@ -2080,8 +2118,17 @@ function find(args: string[], scope: Scope): Verdict {
   let inner: string[] | undefined;
   if (exec >= 0) {
     const end = args.findIndex((a, i) => i > exec && (a === ";" || a === "+"));
-    // {} stands for a path under the search roots.
-    inner = args.slice(exec + 1, end < 0 ? undefined : end).map((a) => (a === "{}" ? "." : a));
+    // {} stands for one match under the search roots, never a root itself: `find . -name
+    // __pycache__ -exec rm -rf {} +` deletes the matches, not the project.
+    // Without a test that picks matches, every path under the root matches, the root included.
+    // A name test of only wildcards and dots (`-name '*'`, `-name '.*'`) can still match the root.
+    const picks =
+      args.some((a) => /^-(i?name|i?path|i?wholename|i?regex|newer\w*|[acm](time|min)|size|empty|user|group|perm)$/.test(a)) &&
+      !args.some((a, i) => /^-i?(name|path|wholename|regex)$/.test(a) && /^[*.?\\]*$/.test(args[i + 1] ?? ""));
+    // A literal -name keeps its name, so `-name .git` still reads as deleting git data.
+    const literal = args.find((a, i) => /^-i?name$/.test(args[i - 1] ?? "") && !/[*?[\\]/.test(a));
+    const under = picks ? `${(roots[0] ?? ".").replace(/\/+$/, "")}/${literal ?? "find-match"}` : ".";
+    inner = args.slice(exec + 1, end < 0 ? undefined : end).map((a) => (a === "{}" ? under : a));
     const rootPaths = (roots.length ? roots : ["."]).map((r) => ({ r, p: resolveWord(r, scope) }));
     const secret = rootPaths.find(({ r, p }) => secretIn(r, scope) || (p && isSecretPath(p)));
     if (secret) return criticalAsk(`find reads a credential location: ${secret.r}`);
@@ -2575,6 +2622,17 @@ const PIPE_TO_SHELL = /\b(curl|wget)\b[^|;&\n]*\|\s*(sudo\s+)?(env\s+)?(ba|z|da|
 // An ssh call next to a shell or interpreter on this machine may feed it what the remote host
 // sends, which nothing here has read. The trusted-host fast path does not apply then.
 const LOCAL_RUNNERS = /^(ba|z|da|k|fi)?sh$|^(python[\d.]*|node|perl|ruby|pwsh|powershell|eval|source|\.|xargs)$/;
+// True when a command reaches other machines only through ssh to hosts in remote.trustedHosts,
+// with plain options, and feeds nothing the host sends into local code. Such a change (not a
+// read, which the rules already allow) may go to the second opinion as a step of the task.
+export function onlyTrustedSsh(command: string, scope: Scope): boolean {
+  if (!scope.trustedHosts?.length) return false;
+  const parsed = parse(command);
+  if (sshFeedsLocalCode(parsed)) return false;
+  const ssh = parsed.cmds.map((c) => unwrap(c.argv)).filter((argv) => path.basename(argv[0] ?? "") === "ssh");
+  return ssh.length > 0 && ssh.every((argv) => !!trustedTarget(argv.slice(1), scope));
+}
+
 function sshFeedsLocalCode(parsed: Parsed): boolean {
   const names = parsed.cmds.map((c) => path.basename(unwrap(c.argv)[0] ?? ""));
   return names.includes("ssh") && names.some((n) => LOCAL_RUNNERS.test(n));
