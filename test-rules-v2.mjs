@@ -102,7 +102,7 @@ for (const command of orcaAllow) bash("allow", command, `orca reads: ${command}`
 bash("allow", `'${install}' status`, "orca install path: status");
 bash("allow", `'${install}' orchestration inbox`, "orca install path: orchestration inbox");
 
-const orcaJudge = [
+const orcaAlsoAllow = [
   "orca orchestration worker-start",
   "orca orchestration worker-stop w1",
   "orca orchestration worker-abandon w1",
@@ -112,42 +112,56 @@ const orcaJudge = [
   "orca orchestration task-create --subject x",
   "orca orchestration run-create",
   "orca orchestration reset",
+  "orca orchestration --help",
+  "orca orchestration run-use --id run_1",
+  "orca orchestration ack --id msg_1",
+  "orca agent launch --agent codex --worktree current",
   "orca worktree create ../other",
   "orca worktree set w1",
+  "orca worktree rm ../other",
+  "orca worktree remove ../other",
   "orca repo add ../other",
   "orca repo set r1",
   "orca terminal read term_1",
   "orca terminal create",
   "orca terminal send hello",
+  "orca terminal send --on term_1 hello",
+  "orca terminal send --on=term_1 hello",
   "orca terminal kill term_1",
-  "orca something-new",
-];
-for (const command of orcaJudge) bash("classify", command, `orca judged: ${command}`);
-
-const orcaAsk = [
-  "orca worktree rm ../other",
-  "orca worktree remove ../other",
   "orca computer screenshot",
   "orca account list",
   "orca serve",
-  "orca terminal send --on term_1 hello",
-  "orca terminal send --on=term_1 hello",
   "orca status --pairing-code abc123",
   "orca orchestration worker-start --environment prod",
   "orca terminal send --environment=prod hello",
+  "orca skills install x",
+  "orca something-new",
 ];
-for (const command of orcaAsk) bash("ask", command, `orca asks: ${command}`);
-
-pattern("orca terminal send *", bash("classify", "orca terminal send hello"), "orca classifies terminal send");
-pattern("orca orchestration worker-start *", bash("classify", "orca orchestration worker-start"), "orca classifies worker-start");
+for (const command of orcaAlsoAllow) bash("allow", command, `orca always allowed: ${command}`);
 
 const pathChanged = bash("classify", "PATH=/tmp/bin orca status", "a changed PATH is not trusted");
 check("orca PATH reason", () => assert.match(pathChanged.reason, /changed PATH/));
 bash("classify", "env PATH=/tmp/bin orca status", "env PATH= is a changed PATH too");
 bash("classify", "./orca status", "an orca-like path outside the install is not trusted");
 bash("classify", "./orca/resources/bin/orca.exe status", "a relative install-shaped path is not trusted");
-bash("classify", "orca skills install x", "a skills subcommand outside list/get is judged");
 bash("allow", "orca", "bare orca prints help");
+bash("allow", "echo $ORCA_TERMINAL_HANDLE $ORCA_SESSION_ID $ORCA_TASK_ID", "orca env vars are not secret");
+bash("classify", "echo $ORCA_API_TOKEN", "orca token env var still counts as secret");
+check("powershell allows orca with $env:ORCA_TERMINAL_HANDLE", () => {
+  const v = powershellVerdict("orca orchestration send --to $env:ORCA_TERMINAL_HANDLE --type status --body 'done'", scope());
+  assert.equal(v.action, "allow", JSON.stringify(v));
+});
+check("rust repo with .cargo/config.toml is not a credential directory", () => {
+  const rustDir = fs.mkdtempSync(path.join(os.tmpdir(), "pi-am-rust-"));
+  fs.mkdirSync(path.join(rustDir, ".cargo"));
+  fs.writeFileSync(path.join(rustDir, ".cargo", "config.toml"), "[build]\n");
+  try {
+    const v = bashVerdict("grep -rn 'fn main' .", makeScope(rustDir, []));
+    assert.equal(v.action, "allow", JSON.stringify(v));
+  } finally {
+    fs.rmSync(rustDir, { recursive: true, force: true });
+  }
+});
 
 // ---- B. Verdict classes ----
 

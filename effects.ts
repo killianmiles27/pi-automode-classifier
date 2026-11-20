@@ -4285,10 +4285,11 @@ const TEXT_DESTRUCTIVE =
 function textOutsideRef(text: string): boolean {
   if (/\$HOME|\$\{HOME\}|%USERPROFILE%|~\/|\benv::var\(\s*["']HOME["']|\bos\.UserHomeDir|\bgetenv\(\s*["']HOME["']/.test(text)) return true;
   if (/\b[A-Za-z]:[\\/]/.test(text)) return true;
-  // An absolute POSIX path, not the double slash of a URL.
-  if (/(?:^|[\s"'(=,:;\[])\/(?!\/)/.test(text)) return true;
-  // A parent traversal.
-  return /(?:^|[\s"'(=,:;\[]|\/)\.\.(?:[\\/]|\s|$)/.test(text);
+  // An absolute POSIX path (not division `a / b`, block comments `/*`, or URLs `//`):
+  // matches either a known top-level system directory or a multi-segment absolute path `/a/b`.
+  if (/(?:^|[\s"'(=,:;\[])\/(?![/*\s]|$)(?:(?:etc|usr|var|home|root|opt|bin|sbin|lib|srv|mnt|media|proc|sys|dev|tmp|Users|Library|Applications|System)(?:\/|[\s"'),;\]]|$)|[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+)/.test(text)) return true;
+  // A parent directory traversal (`../` or `..\`), not a Rust range expression (`0..`, `.. `).
+  return /(?:^|[\s"'(=,:;\[]|\/)\.\.[\\/]/.test(text);
 }
 
 function isLoopbackUrl(u: string): boolean {
@@ -4325,7 +4326,7 @@ function scanTextEnv(state: State, text: string): void {
 function scanTextNetwork(state: State, text: string): void {
   const lines = text.replace(/\\\r?\n/g, " ").split(/\r?\n/);
   for (const line of lines) {
-    const urls = line.match(/\b[a-z][a-z0-9+.-]*:\/\/[^\s"'`<>)\]},;]+/gi) || [];
+    const urls = line.match(/\b(?:https?|wss?|ftps?|sftp|ssh|tcp|udp|tls|ldaps?|smb|mqtts?|amqps?|grpcs?):\/\/[^\s"'`<>)\]},;]+/gi) || [];
     const command = TEXT_NETWORK_WORD.test(line);
     if (!command && !urls.length) continue;
     const external = urls.filter((u) => !isLoopbackUrl(u));

@@ -4,7 +4,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { execFileSync } from "node:child_process";
-import extension, { DEFAULTS, explain, hooks, loadConfig, parseScores, replyTarget } from "./index.ts";
+import extension, { DEFAULTS, explain, hooks, isRateLimitError, loadConfig, parseScores, replyTarget, startsRunner } from "./index.ts";
 import { contextState, judgeState, redact } from "./context.ts";
 
 let failures = 0;
@@ -298,6 +298,20 @@ check(!JSON.stringify(red).includes("sk-abcdefghijklmnopqrstuvwxyz") && !JSON.st
 const older = contextState({ requests: ["use key sk-abcdefghijklmnopqrstuvwxyz"], tool: "bash", command: "export API_KEY=hunter2", cwd: "/", inside: true });
 check(!JSON.stringify(older).includes("hunter2"), "the benchmark's state is masked too");
 check(redact("password: 'x y z'").text === "password: <redacted>", "quoted secrets are masked whole");
+
+// Non-executing subcommands do not trigger the runner scan.
+check(!startsRunner("cargo fmt --check"), "cargo fmt --check does not trigger runner scan");
+check(!startsRunner("cargo fmt --version"), "cargo fmt --version does not trigger runner scan");
+check(!startsRunner("cargo tree"), "cargo tree does not trigger runner scan");
+check(!startsRunner("npm ls"), "npm ls does not trigger runner scan");
+check(!startsRunner("go version"), "go version does not trigger runner scan");
+check(startsRunner("cargo test"), "cargo test triggers runner scan");
+check(startsRunner("npm test"), "npm test triggers runner scan");
+
+// Rate-limit classification.
+check(isRateLimitError("429: overloaded"), "429 overloaded is retryable rate limit");
+check(!isRateLimitError("402 insufficient funds"), "402 funds is hard quota, not transient rate limit");
+check(!isRateLimitError("429 quota exceeded"), "429 quota exceeded is treated as hard quota");
 
 fs.rmSync(project, { recursive: true, force: true });
 console.log(failures ? `\n${failures} FAILED` : "\nall passed");

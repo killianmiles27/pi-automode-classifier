@@ -12,7 +12,10 @@
     "llama.cpp"
   ],
   "license": "MIT",
-  "author": "Deepu K Sasidharan",
+  "author": "Killian Miles",
+  "contributors": [
+    "Deepu K Sasidharan (original pi-automode-classifier)"
+  ],
   "repository": {
     "type": "git",
     "url": "git+https://github.com/killianmiles27/pi-automode-classifier.git"
@@ -55,8 +58,5 @@
     "extensions": [
       "./index.ts"
     ]
-  },
-  "contributors": [
-    "Killian Miles (context decider)"
-  ]
+  }
 }

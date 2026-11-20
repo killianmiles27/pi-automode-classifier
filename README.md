@@ -16,15 +16,15 @@ It is not a sandbox. It guards the agent's tool calls. It doesn't guard `!` comm
 
 ## Auto Mode Safe and Auto Mode Autonomous
 
-This fork has two working modes. **Auto Mode Safe** (`/mode safe`) runs almost everything and asks you only about what stays unresolved. **Auto Mode Autonomous** (`/mode autonomous`) never asks: the judges decide, what they will not clear is blocked, and the agent carries on and reports it. Alt+M cycles through them and YOLO. [docs/AUTO-MODES.md](docs/AUTO-MODES.md) has how decisions are made, the setup, measured results, and what they do not protect against.
+It has two working modes. **Auto Mode Safe** (`/mode safe`) runs almost everything and asks you only about what stays unresolved. **Auto Mode Autonomous** (`/mode autonomous`) never asks: the judges decide, what they will not clear is blocked, and the agent carries on and reports it. Alt+M cycles through them and YOLO. [docs/AUTO-MODES.md](docs/AUTO-MODES.md) has how decisions are made, the setup, measured results, and what they do not protect against.
 
-The rest of this README describes the parts they are built from. The decider section below describes the fork's earlier `authorized`/`harmful` questions, which the published benchmark still uses; live decisions now use four questions and measured code effects.
+The rest of this README describes the parts they are built from. The decider section below describes the earlier `authorized`/`harmful` questions, which the published benchmark still uses; live decisions now use four questions and measured code effects.
 
-## This fork: a decider that knows what you asked for
+## A decider that knows what you asked for
 
-> Fork of [deepu105/pi-automode-classifier](https://github.com/deepu105/pi-automode-classifier) 0.3.0. Everything below this section is upstream's documentation and still applies.
+> This project started from [deepu105/pi-automode-classifier](https://github.com/deepu105/pi-automode-classifier) 0.3.0 by Deepu K Sasidharan and is now developed separately. See [Credits](#credits). Sections after this one are adapted from that project's documentation and still apply.
 
-LANCET and the other stage-2 classifiers see only the command, so they cannot tell `rm -rf build/` you asked for from one you didn't. The chat decider can, but it is slow. This fork adds a `context` decider: [Jev](https://docs.typesafe.ai/api), a decision model, answers two typed questions in about a quarter second:
+LANCET and the other stage-2 classifiers see only the command, so they cannot tell `rm -rf build/` you asked for from one you didn't. The chat decider can, but it is slow. This project adds a `context` decider: [Jev](https://docs.typesafe.ai/api), a decision model, answers two typed questions in about a quarter second:
 
 - **authorized**: did your own requests ask for this action, including its destructive, remote or publishing part?
 - **harmful**: could it do harm that is hard to undo?
@@ -78,8 +78,6 @@ Tests: `npm test` runs upstream's 634 cases plus `test-context.mjs`, which drive
 ```bash
 pi install npm:pi-automode-classifier
 # or straight from GitHub
-pi install git:github.com/deepu105/pi-automode-classifier
-# this fork
 pi install git:github.com/killianmiles27/pi-automode-classifier
 ```
 
@@ -91,7 +89,7 @@ In a session, `/automode-classifier off` turns the guard off, `on` turns it back
 
 ## Native Windows (0.5.0)
 
-Use native Pi with Git for Windows installed in its standard location. Install this fork with `pi install git:github.com/killianmiles27/pi-automode-classifier`. The extension contains no bundled Pi executable, model, API key, or machine-specific configuration.
+Use native Pi with Git for Windows installed in its standard location. Install it with `pi install git:github.com/killianmiles27/pi-automode-classifier`. The extension contains no bundled Pi executable, model, API key, or machine-specific configuration.
 
 - `/mode` opens the Auto/YOLO selector; `/mode auto` and `/mode yolo` switch directly. **Alt+M** toggles them. The status shows `AUTO` or `YOLO`.
 - Auto applies the guard. YOLO bypasses this extension's checks and stops its local classifier process. Other host permissions still apply. Switching is session-only: a new session restores `enabled` from your configuration (Auto by default).
@@ -936,3 +934,7 @@ Any setup:
 ## License
 
 MIT
+
+## Credits
+
+This project began as a fork of [pi-automode-classifier](https://github.com/deepu105/pi-automode-classifier) by Deepu K Sasidharan (MIT). The rules engine, the stage-2 classifier integrations, the chat decider, the benchmark suites and much of the documentation come from that project. Their copyright notice is kept in [LICENSE](LICENSE).

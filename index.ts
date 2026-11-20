@@ -226,7 +226,6 @@ export const DEFAULTS: Config = {
   secretPaths: [],
 };
 
-// The guard's own files and Pi's settings: changes to them always ask.
 // The guard's own files and Pi's settings: changes to them always ask. `guardedPaths` adds more.
 const GUARDED = [HERE, path.dirname(CONFIG_FILE), path.join(AGENT_DIR, "settings.json"), path.join(AGENT_DIR, "sandbox.json"), path.join(AGENT_DIR, "keybindings.json")];
 
@@ -377,7 +376,7 @@ export function loadConfig(file = CONFIG_FILE): { config: Config; error?: string
   let raw: unknown;
   try {
     // Windows PowerShell's `Set-Content -Encoding utf8` writes a BOM, which JSON.parse rejects.
-    raw = JSON.parse(fs.readFileSync(file, "utf8").replace(/^﻿/, ""));
+    raw = JSON.parse(fs.readFileSync(file, "utf8").replace(/^\uFEFF/, ""));
   } catch (e) {
     return ignored((e as Error).message);
   }
@@ -674,7 +673,32 @@ function resolveModel(registry: ChatRegistry, config: Config, sessionModel?: Rec
 
 const thinks = ({ model }: Resolved) => Boolean(model.reasoning);
 
-async function askOnce(
+// Transient upstream rate-limit or overload errors (HTTP 429/503/529) worth retrying with backoff.
+// Hard billing/quota exhaustion (402, insufficient funds) is not transient and is not retried.
+const HARD_QUOTA_RE = /\b402\b|insufficient|funds|credit|balance|quota/i;
+const RATE_LIMIT_RE = /\b429\b|rate.?limit|too many requests|overloaded|\b503\b|\b529\b|temporarily unavailable/i;
+export const isRateLimitError = (message: string | undefined): boolean => !!message && RATE_LIMIT_RE.test(message) && !HARD_QUOTA_RE.test(message);
+
+function retryDelayMs(attempt: number, message?: string): number {
+  const match = message ? /retry[- ]after[:\s]+(\d+(?:\.\d+)?)/i.exec(message) : null;
+  if (match) {
+    const secs = Number(match[1]);
+    if (Number.isFinite(secs) && secs > 0) return Math.min(Math.round(secs * 1000), 8000);
+  }
+  const base = attempt === 0 ? 1500 : 3500;
+  return base + Math.round(Math.random() * 500);
+}
+
+function sleep(ms: number, signal?: AbortSignal): Promise<boolean> {
+  if (signal?.aborted) return Promise.resolve(false);
+  return new Promise((resolve) => {
+    const onAbort = () => { clearTimeout(timer); resolve(false); };
+    const timer = setTimeout(() => { signal?.removeEventListener("abort", onAbort); resolve(true); }, ms);
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
+async function askSingleAttempt(
   registry: ChatRegistry,
   resolved: Resolved,
   system: string,
@@ -714,6 +738,21 @@ async function askOnce(
   return { text, cut, tokens: u ? (u.input ?? 0) + (u.cacheRead ?? 0) + (u.output ?? 0) : undefined };
 }
 
+async function askOnce(
+  registry: ChatRegistry,
+  resolved: Resolved,
+  system: string,
+  message: string,
+  opts: { maxTokens: number; thinking: boolean; signal?: AbortSignal; sessionId?: string; retries?: number },
+): Promise<{ text?: string; cut?: boolean; error?: string; tokens?: number }> {
+  const maxRetries = opts.retries ?? 2;
+  for (let attempt = 0; ; attempt++) {
+    const res = await askSingleAttempt(registry, resolved, system, message, opts);
+    if (!res.error || attempt >= maxRetries || opts.signal?.aborted || !isRateLimitError(res.error)) return res;
+    if (!(await sleep(retryDelayMs(attempt, res.error), opts.signal))) return res;
+  }
+}
+
 // Claude Code's pipeline for one action: the transcript plus the action go in one user message,
 // stage 1 filters, stage 2 reasons about what stage 1 flagged.
 export async function decideWithLlm(
@@ -724,14 +763,16 @@ export async function decideWithLlm(
   sessionModel?: Record<string, unknown>,
   sessionId?: string,
 ): Promise<LlmDecision> {
-  const first = await decideOnce(config, items, signal, registry, sessionModel, sessionId);
   const fb = config.llm.fallback;
+  const hasFallback = Boolean(fb.model && !(fb.model === config.llm.model && fb.provider === config.llm.provider));
+  // When a fallback model is configured, fail over immediately on 429/overload instead of waiting
+  // on the overloaded primary; retry with backoff on the last available model.
+  const first = await decideOnce(config, items, signal, registry, sessionModel, sessionId, hasFallback ? 0 : 2);
   // Only a model that gave no answer is replaced. One that answered without a verdict is not
   // retried elsewhere, and a cancelled call stays cancelled.
-  if (!("error" in first) || first.unparsed || !fb.model || signal?.aborted) return first;
+  if (!("error" in first) || first.unparsed || !hasFallback || signal?.aborted) return first;
   const via = [fb.provider, fb.model].filter(Boolean).join("/");
-  if (fb.model === config.llm.model && fb.provider === config.llm.provider) return first;
-  const second = await decideOnce({ ...config, llm: { ...config.llm, provider: fb.provider, model: fb.model, name: "" } }, items, signal, registry, sessionModel, sessionId);
+  const second = await decideOnce({ ...config, llm: { ...config.llm, provider: fb.provider, model: fb.model, name: "" } }, items, signal, registry, sessionModel, sessionId, 1);
   if ("error" in second) return { ...second, error: `${first.error}; fallback ${via}: ${second.error}`, ms: first.ms + second.ms };
   return { ...second, via, ms: first.ms + second.ms };
 }
@@ -743,6 +784,7 @@ async function decideOnce(
   registry?: ChatRegistry,
   sessionModel?: Record<string, unknown>,
   sessionId?: string,
+  retries = 2,
 ): Promise<LlmDecision> {
   const started = performance.now();
   const ms = () => Math.round(performance.now() - started);
@@ -762,7 +804,7 @@ async function decideOnce(
   if (actionChars > budget) return { error: `the action is ${actionChars} chars and the model window has room for ${budget}`, lasting: true, ms: ms() };
   const transcript = buildTranscript(items, { ...llm.transcript, maxChars: Math.min(llm.transcript.maxChars, budget - actionChars) });
   const send = (instruction: string, opts: { maxTokens: number; thinking: boolean }) =>
-    askOnce(registry, resolved, system, `${transcript}\n\n${instruction}`, { ...opts, signal, sessionId });
+    askOnce(registry, resolved, system, `${transcript}\n\n${instruction}`, { ...opts, signal, sessionId, retries });
 
   let stage = llm.twoStage ? "fast" : "reasoning";
   let tokens = 0;
@@ -781,7 +823,7 @@ async function decideOnce(
   tokens += second.tokens ?? 0;
   // A reasoning model can spend the whole budget thinking. One larger try, within the model's limits,
   // beats holding the call back for a reason that has nothing to do with the call.
-  const larger = Math.min(llm.maxTokens * 4, Number((sessionModel as { maxTokens?: number } | undefined)?.maxTokens) || llm.maxTokens * 4);
+  const larger = Math.min(llm.maxTokens * 4, Number(resolved.model.maxTokens) || llm.maxTokens * 4);
   if (second.cut && larger > llm.maxTokens) {
     const retry = await send(stage2Instruction(thinks(resolved)), { maxTokens: larger, thinking: true });
     if (!retry.error) {
@@ -921,7 +963,7 @@ export function inCheckout(file: string, roots: string[]): boolean {
 // read as a config or cannot be written.
 function saveToConfig(list: "allowedPaths" | "allow", value: string): string | undefined {
   try {
-    const raw: unknown = fs.existsSync(CONFIG_FILE) ? JSON.parse(fs.readFileSync(CONFIG_FILE, "utf8").replace(/^﻿/, "")) : {};
+    const raw: unknown = fs.existsSync(CONFIG_FILE) ? JSON.parse(fs.readFileSync(CONFIG_FILE, "utf8").replace(/^\uFEFF/, "")) : {};
     if (!isObject(raw)) throw new Error("it must be a JSON object");
     if (list === "allow" && raw.rules === undefined) raw.rules = {};
     const holder = list === "allow" ? raw.rules : raw;
@@ -996,6 +1038,9 @@ async function systemOne(config: Config, url: string, headers: Record<string, st
       const body = await res.json().catch(() => undefined);
       if (!res.ok) {
         const message = String(body?.error?.message ?? `HTTP ${res.status}`);
+        if ((res.status === 429 || res.status === 503) && attempt < 2 && !signal?.aborted) {
+          if (await sleep(retryDelayMs(attempt, message), signal)) continue;
+        }
         return { error: /too large|exceeds the available context/.test(message) ? "command is too long for the model" : message, ms: ms() };
       }
       const served = String(body?.model ?? "");
@@ -1052,18 +1097,25 @@ export async function contextViaPi(config: Config, state: Record<string, unknown
   if (!model) return { error: `Pi has no classifier model ${c.provider}/${c.model}`, ms: ms() };
   // Pi calls a yes/no question "bool".
   const questions = Object.fromEntries(Object.entries(JUDGE_QUESTIONS).map(([id, q]) => [id, { ...q, type: "bool" }]));
-  const timeout = AbortSignal.timeout(c.timeoutMs);
-  const result = await registry!.classify(model, { state, questions }, { signal: signal ? AbortSignal.any([signal, timeout]) : timeout });
-  if (timeout.aborted) return { error: `no answer in ${c.timeoutMs} ms`, ms: ms() };
-  if (result.stopReason !== "stop") return { error: clip(result.errorMessage ?? `${c.provider}/${c.model} gave no answer`, 200), ms: ms() };
-  const answers: Record<string, number> = {};
-  for (const id of Object.keys(questions)) {
-    const a = result.answers?.[id] as { probability?: number; noul?: number } | number | undefined;
-    const p = typeof a === "number" ? a : (a?.probability ?? a?.noul);
-    if (typeof p !== "number" || !(p >= 0 && p <= 1)) return { error: "invalid response from the model", ms: ms() };
-    answers[id] = p;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const timeout = AbortSignal.timeout(c.timeoutMs);
+    const result = await registry!.classify(model, { state, questions }, { signal: signal ? AbortSignal.any([signal, timeout]) : timeout });
+    if (timeout.aborted) return { error: `no answer in ${c.timeoutMs} ms`, ms: ms() };
+    if (result.stopReason !== "stop") {
+      const error = clip(result.errorMessage ?? `${c.provider}/${c.model} gave no answer`, 200);
+      if (attempt === 0 && !signal?.aborted && isRateLimitError(error) && (await sleep(1200, signal))) continue;
+      return { error, ms: ms() };
+    }
+    const answers: Record<string, number> = {};
+    for (const id of Object.keys(questions)) {
+      const a = result.answers?.[id] as { probability?: number; noul?: number } | number | undefined;
+      const p = typeof a === "number" ? a : (a?.probability ?? a?.noul);
+      if (typeof p !== "number" || !(p >= 0 && p <= 1)) return { error: "invalid response from the model", ms: ms() };
+      answers[id] = p;
+    }
+    return { answers, ms: ms() };
   }
-  return { answers, ms: ms() };
+  return { error: `${c.provider}/${c.model} gave no answer`, ms: ms() };
 }
 
 const sessionIdOf = (ctx: ExtensionContext): string | undefined => {
@@ -1097,25 +1149,42 @@ export function parseScores(text: string): Record<string, number> | undefined {
     return undefined;
   }
 }
+async function scoreOnce(
+  registry: ChatRegistry,
+  resolved: Resolved,
+  state: Record<string, unknown>,
+  signal?: AbortSignal,
+  sessionId?: string,
+): Promise<{ answers?: Record<string, number>; error?: string }> {
+  const quick = { ...resolved, llm: { ...resolved.llm, timeoutMs: Math.min(resolved.llm.timeoutMs, 30_000) } };
+  // A reasoning model can use up a small budget before it answers, so a second try gets more room.
+  // An API error (429, timeout, auth) stops immediately instead of hammering the endpoint again.
+  let lastError = "the chat scorer gave no scores";
+  for (const maxTokens of [1500, 6000]) {
+    const r = await askOnce(registry, quick, SCORER_SYSTEM, JSON.stringify(state), { maxTokens, thinking: false, signal, sessionId });
+    if (r.error) return { error: r.error };
+    const answers = parseScores(r.text ?? "");
+    if (answers) return { answers };
+  }
+  return { error: lastError };
+}
 export async function scoreViaChat(config: Config, state: Record<string, unknown>, registry: ChatRegistry | undefined, sessionModel: Record<string, unknown> | undefined, signal?: AbortSignal, sessionId?: string): Promise<ContextAnswer> {
   const started = performance.now();
   const ms = () => Math.round(performance.now() - started);
   if (!registry) return { error: "no model registry", ms: ms() };
   const resolved = resolveModel(registry, config, sessionModel);
   if (resolved.error) return { error: resolved.error, ms: ms() };
-  const quick = { ...resolved, llm: { ...resolved.llm, timeoutMs: Math.min(resolved.llm.timeoutMs, 30_000) } };
-  // A reasoning model can use up a small budget before it answers, so a second try gets more room.
-  let lastError = "the chat scorer gave no scores";
-  for (const maxTokens of [1500, 6000]) {
-    const r = await askOnce(registry, quick, SCORER_SYSTEM, JSON.stringify(state), { maxTokens, thinking: false, signal, sessionId });
-    if (r.error) {
-      lastError = r.error;
-      continue;
+  const first = await scoreOnce(registry, resolved, state, signal, sessionId);
+  if (first.answers) return { answers: first.answers, ms: ms() };
+  const fb = config.llm.fallback;
+  if (fb.model && !signal?.aborted && !(fb.model === config.llm.model && fb.provider === config.llm.provider)) {
+    const fbResolved = resolveModel(registry, { ...config, llm: { ...config.llm, provider: fb.provider, model: fb.model, name: "" } }, sessionModel);
+    if (!fbResolved.error) {
+      const second = await scoreOnce(registry, fbResolved, state, signal, sessionId);
+      if (second.answers) return { answers: second.answers, ms: ms() };
     }
-    const answers = parseScores(r.text ?? "");
-    if (answers) return { answers, ms: ms() };
   }
-  return { error: lastError, ms: ms() };
+  return { error: first.error ?? "the chat scorer gave no scores", ms: ms() };
 }
 
 // When the user's last message is a short reply ("yes u may do that"), the agent
@@ -1149,7 +1218,7 @@ export async function explain(config: Config, command: string, cwd: string, regi
   const base = (e.provider || e.model ? registry?.find(e.provider, e.model) : sessionModel) as Record<string, unknown> | undefined;
   if (!base) return undefined;
   const resolved: Resolved = { model: { ...base, reasoning: false, maxTokens: 160 }, llm: { ...config.llm, timeoutMs: e.timeoutMs, thinkingLevel: "off" } };
-  const r = await askOnce(registry!, resolved, EXPLAIN_SYSTEM, `Working directory: ${cwd}\n\nCommand:\n${clip(redact(command).text, 4000)}`, { maxTokens: 160, thinking: false, signal, sessionId });
+  const r = await askOnce(registry!, resolved, EXPLAIN_SYSTEM, `Working directory: ${cwd}\n\nCommand:\n${clip(redact(command).text, 4000)}`, { maxTokens: 160, thinking: false, signal, sessionId, retries: 0 });
   return r.text ? clip(r.text.replace(/\s+/g, " "), 400) : undefined;
 }
 
@@ -1203,14 +1272,31 @@ function changedSince(base: string | undefined, cwd: string): string[] {
   const out = [...(base ? (git(cwd, "diff", "--name-only", "--relative", base) ?? "").split("\n") : []), ...(git(cwd, "ls-files", "--others", "--exclude-standard") ?? "").split("\n")];
   return out.filter(Boolean).slice(0, 200).map((p) => path.resolve(cwd, p));
 }
+// Subcommands of package/build tools that only inspect or format and never execute project code.
+const NON_EXEC_SUBCOMMANDS: Record<string, Set<string>> = {
+  cargo: new Set(["fmt", "tree", "metadata", "search", "pkgid", "locate-project", "info", "version", "help"]),
+  npm: new Set(["ls", "list", "view", "info", "outdated", "why", "explain", "audit", "version", "help"]),
+  pnpm: new Set(["ls", "list", "view", "info", "outdated", "why", "audit", "version", "help"]),
+  yarn: new Set(["list", "info", "outdated", "why", "audit", "version", "help"]),
+  bun: new Set(["pm", "version", "help"]),
+  go: new Set(["version", "env", "list", "doc", "fmt", "help"]),
+  uv: new Set(["version", "help", "tree"]),
+  pip: new Set(["list", "show", "freeze", "check", "help"]),
+  pip3: new Set(["list", "show", "freeze", "check", "help"]),
+};
 // Whether a command starts a project runner. Quoted text is an argument, not a command (a message
-// that mentions "cargo test" runs nothing), and `cargo --version` runs no project code.
+// that mentions "cargo test" runs nothing), and `cargo --version` or `cargo fmt` runs no project code.
 export function startsRunner(command: string): boolean {
   const bare = command.replace(/'[^']*'|"(?:[^"\\]|\\.)*"/g, '""');
   const runner = new RegExp(RUNNER.source, "g");
   for (const m of bare.matchAll(runner)) {
-    const next = bare.slice((m.index ?? 0) + m[0].length).trimStart().split(/[\s;&|)]/)[0];
-    if (!/^(--version|-V|--help|-h)$/.test(next)) return true;
+    const tool = m[1];
+    const rest = bare.slice((m.index ?? 0) + m[0].length).split(/[;&|)]/)[0].trim().split(/\s+/).filter(Boolean);
+    const next = rest[0] ?? "";
+    if (/^(--version|-V|--help|-h)$/.test(next)) continue;
+    if (rest.length <= 2 && rest.some((w) => /^(--version|-V|--help|-h)$/.test(w))) continue;
+    if (NON_EXEC_SUBCOMMANDS[tool]?.has(next)) continue;
+    return true;
   }
   return false;
 }
@@ -1332,8 +1418,9 @@ export default function (pi: ExtensionAPI, overrides: Partial<Config> = {}) {
   const blockedCalls: { tool: string; subject: string; reason: string }[] = [];
   let reportedBlocks = 0;
   let blockStreak = 0;
-  // After a quota error Jev is left alone for a while, and the chat model scores instead.
+  // After a quota error Jev is paused for 10 minutes; after a transient 429 rate limit, 60 seconds.
   const JEV_PAUSE_MS = 10 * 60_000;
+  const JEV_RATELIMIT_PAUSE_MS = 60_000;
   let jevPausedUntil = 0;
   let jevNoticed = false;
   // Set with /automode trust: the user's own standing statement of what this session may do.
@@ -1372,7 +1459,7 @@ export default function (pi: ExtensionAPI, overrides: Partial<Config> = {}) {
     // the first real call tens of seconds. One throwaway call fills the prefix cache instead.
     if (enabled && config.decider.includes("llm") && config.llm.warmCache) {
       const warm: TranscriptItem[] = [{ kind: "user", text: "warming the rule prompt" }, { kind: "action", tool: "bash", input: { command: "true" } }];
-      void decideWithLlm(config, warm, undefined, ctx.modelRegistry as unknown as ChatRegistry, ctx.model as unknown as Record<string, unknown>).catch(() => undefined);
+      void decideWithLlm(config, warm, undefined, ctx.modelRegistry as unknown as ChatRegistry, ctx.model as unknown as Record<string, unknown>, sessionIdOf(ctx)).catch(() => undefined);
     }
   });
   pi.on("session_shutdown", async () => stopClassifierProcess());
@@ -1497,7 +1584,7 @@ export default function (pi: ExtensionAPI, overrides: Partial<Config> = {}) {
     };
     // A call allowed while it was not critical asks again once the same text is, for example a
     // script that a download has since replaced.
-    const key = `${verdict.critical ? "critical" : ""}\0${event.toolName}\0${ctx.cwd}\0${subject}\0${contentHash}`;
+    let key = `${verdict.critical ? "critical" : ""}\0${event.toolName}\0${ctx.cwd}\0${subject}\0${contentHash}`;
     // The user allowed this exact call for the session, so no model gets to block it again.
     if (!piped && verdict.action === "classify" && sessionAllowed.has(key)) {
       finish("allow", "session");
@@ -1534,6 +1621,7 @@ export default function (pi: ExtensionAPI, overrides: Partial<Config> = {}) {
       const cls = floorClass(verdict, report, scope);
       if (cls === "locked" && !verdict.locked) verdict = { ...verdict, action: "ask", class: "locked", locked: true, reason: `${verdict.reason || "runs code"}; its code changes the auto-mode guard's own files` };
       else if (cls === "critical" && verdict.class !== "critical") verdict = { ...verdict, action: "ask", class: "critical", critical: true, firm: true, reason: `${verdict.reason || "runs code"}; its code reads credential files outside the project` };
+      key = `${verdict.critical ? "critical" : ""}\0${event.toolName}\0${ctx.cwd}\0${subject}\0${contentHash}`;
       // Code it actually runs. The command line itself is analyzed too, but that does not make it measured code.
       const measuredCode = !!report && (ranScripts.length > 0 || inlineCount > 0);
       const facts: Facts = {
@@ -1600,15 +1688,21 @@ export default function (pi: ExtensionAPI, overrides: Partial<Config> = {}) {
           })
           .filter((a) => !(a.tool === event.toolName && a.text === subject && !a.outcome));
         const state = judgeState({ requests, replyTo: replyTarget(branch), tool: event.toolName, command: judgedText ?? subject, cwd: ctx.cwd, inside: inCheckout(ctx.cwd, roots), note: verdict.reason, effects: report?.facts, recent, standing: standing || undefined });
-        let answer: ContextAnswer = { error: "paused after a quota error" };
+        let answer: ContextAnswer = { error: "paused after a quota or rate-limit error" };
         if (Date.now() >= jevPausedUntil) {
           answer = hooks.context
             ? await hooks.context(state, JUDGE_QUESTIONS, { provider: c.provider, model: c.model, timeoutMs: c.timeoutMs, signal: ctx.signal })
             : await contextViaPi(config, state, ctx.modelRegistry as unknown as Registry, ctx.signal);
           steps.push({ decider: "context", model: `${c.provider}/${c.model}`, ...answer });
-          if (/429|402|limit|funds|quota/i.test(answer.error ?? "")) {
+          if (answer.answers) {
+            jevNoticed = false;
+          } else if (HARD_QUOTA_RE.test(answer.error ?? "")) {
             jevPausedUntil = Date.now() + JEV_PAUSE_MS;
             if (ctx.hasUI && !jevNoticed) ctx.ui.notify(`Jev is out of quota (${clip(answer.error ?? "", 120)}). Using the chat model to score calls for now.`, "warning");
+            jevNoticed = true;
+          } else if (isRateLimitError(answer.error)) {
+            jevPausedUntil = Date.now() + JEV_RATELIMIT_PAUSE_MS;
+            if (ctx.hasUI && !jevNoticed) ctx.ui.notify(`Jev hit a rate limit (${clip(answer.error ?? "", 120)}). Pausing Jev for 60s and using the chat scorer.`, "warning");
             jevNoticed = true;
           }
         }

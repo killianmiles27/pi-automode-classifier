@@ -2542,6 +2542,8 @@ const textNeighbours = [
   ["a home reference with no destructive operation", "paths:\n\tcp -r src $HOME/backup\n", "local"],
   ["an outside path with no destructive operation", "paths:\n\tls /srv/app/data\n", "local"],
   ["an ordinary build file", "all:\n\t@echo building\n", "local"],
+  ["Rust Command::new with division, block comment and range", "fn main() { /* comment */ let x = 10 / 2; for i in 0..x { let _ = std::process::Command::new(\"cargo\").arg(\"--version\"); } }\n", "review"],
+  ["Rust with non-network URI scheme", 'fn open_settings() { let _ = "ms-settings://privacy"; let _ = "file:///tmp/a"; }\n', "local"],
 ];
 for (const [name, text, level] of textNeighbours) expectTextLevel(`r2 text neighbour: ${name}`, text, level);
 

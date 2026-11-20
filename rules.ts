@@ -537,7 +537,7 @@ const CREDENTIAL_DIRS = [
   /^\/etc(\/|$)/,
   /^\/proc\//,
 ];
-const CREDENTIAL_CHILDREN = [".ssh", ".aws", ".gnupg", ".kube", ".pi/agent", ".config/gh", ".docker", ".cargo"];
+const CREDENTIAL_CHILDREN = [".ssh", ".aws", ".gnupg", ".kube", ".pi/agent", ".config/gh", ".docker"];
 /** True for a directory (or a home directory root) that holds credential files. */
 export function isCredentialDirectory(p: string | undefined): boolean {
   if (!p) return false;
@@ -550,7 +550,9 @@ export function isCredentialDirectory(p: string | undefined): boolean {
   if (CREDENTIAL_DIRS.some((re) => re.test(s) || re.test(s + "/"))) return true;
   // A home-shaped root (the eval fake home, a copied home) holds credentials in child folders.
   // Only a child that actually exists counts; appending `.ssh` to every project path would make
-  // every project folder look like a credential store.
+  // every project folder look like a credential store. A project's `.cargo/config.toml` is not a
+  // credential store unless `.cargo/credentials` or `.cargo/credentials.toml` exists there.
+  if (fs.existsSync(path.join(s, ".cargo", "credentials")) || fs.existsSync(path.join(s, ".cargo", "credentials.toml"))) return true;
   return CREDENTIAL_CHILDREN.some((child) => {
     const dir = slash(path.join(s, child));
     return fs.existsSync(dir) && CREDENTIAL_DIRS.some((re) => re.test(dir.replace(/\/+$/, "") + "/"));
@@ -571,6 +573,9 @@ const SECRET_ENV_WORD = /^(key|keys|apikey|token|tokens|secret|secrets|password|
 export function isSecretEnvName(name: string): boolean {
   const upper = name.toUpperCase();
   if (SAFE_ENV.has(upper)) return false;
+  // Orca orchestration metadata (ORCA_SESSION_ID, ORCA_TERMINAL_HANDLE, ORCA_TASK_ID, etc.) is
+  // not a credential unless the name explicitly refers to a secret or key.
+  if (upper.startsWith("ORCA_") && !/(?:^|_)(KEY|KEYS|APIKEY|TOKEN|TOKENS|SECRET|SECRETS|PASSWORD|PASSWD|PASSPHRASE|CREDENTIAL|CREDENTIALS|AUTH|PRIVATE)(?:_|$)/.test(upper)) return false;
   const value = upper.replace(/_(FILE|PATH|DIR|FOLDER|NAME|PREFIX|SUFFIX|TYPE|URL)$/, "");
   if (SAFE_ENV.has(value)) return false;
   return value.split(/_+/).some((word) => SECRET_ENV_WORD.test(word));
@@ -1626,24 +1631,10 @@ function subcommand(tool: string, args: string[]): Verdict {
   return ASK_BY_DEFAULT[tool] ? ask(`${tool} ${sub} ${ASK_BY_DEFAULT[tool]}`) : { ...classify(`${tool} ${sub}`), pattern: `${tool} ${sub} *` };
 }
 
-// Orca coordination (spec section 11). The subcommand decides, never a blanket: reads are
-// allowed, coordination that can start or stop another agent's work is judged, and anything
-// that touches another machine or the GUI asks. A PATH assignment, or a program that is not
-// Orca's own executable, means the name cannot be trusted.
-const ORCA_READ: Record<string, string> = {
-  skills: "list get",
-  worktree: "list show current ps",
-  repo: "list show",
-  terminal: "list show",
-  orchestration: `send ask reply check inbox worker_done run-current run-show run-list task-list task-update
-    dispatch-show worker-show worker-read worker-list gate-list request-show`,
-};
-const ORCA_JUDGE: Record<string, string> = {
-  worktree: "create set",
-  repo: "add set",
-  orchestration: `worker-start worker-stop worker-abandon worker-release dispatch task-create run-create reset`,
-};
-const ORCA_ASK = new Set(["computer", "account", "serve"]);
+// Orca CLI & orchestration: always allowed so agents and orchestrators can freely coordinate,
+// launch/read terminals, manage worktrees, and report back in both directions. A PATH assignment
+// or a program outside Orca's install (e.g. `./orca`) is still classified so a local binary cannot
+// spoof `orca`.
 const ORCA_INSTALL = /(^|\/)orca\/resources\/bin\/orca(\.exe)?$/i;
 const orcaProgram = (program: string) => {
   if (/^orca(\.exe)?$/i.test(program)) return true;
@@ -1654,24 +1645,13 @@ const orcaProgram = (program: string) => {
 const orcaPattern = (sub: string | undefined, second: string | undefined) =>
   sub && /^[a-z][\w-]*$/i.test(sub) ? `orca ${sub}${second && /^[a-z][\w-]*$/i.test(second) ? ` ${second}` : ""} *` : undefined;
 function orca(args: string[], words: string[]): Verdict {
-  // Any command that can reach a remote host asks, whatever its subcommand.
-  if (args.some((a) => /^--(pairing-code|environment)(=|$)/.test(a))) return ask(`orca ${args.find((a) => /^--(pairing-code|environment)(=|$)/.test(a))} reaches a remote host`);
-  if (args.some((a) => /^--on(=|$)/.test(a))) return ask("orca --on reaches another terminal, possibly on a remote host");
   // A changed PATH can point `orca` at another program.
   if (words.some((w) => /^PATH=/.test(w))) {
     const judged = classify("orca with a changed PATH");
     const pattern = orcaPattern(args[0], args[1]);
     return pattern ? { ...judged, pattern } : judged;
   }
-  const [sub = "", second] = args;
-  if (!sub || /^(--help|-h|--version|-v|help)$/i.test(sub)) return ALLOW;
-  if (sub === "status" || sub === "agent-context") return ALLOW;
-  const allow = ORCA_READ[sub];
-  if (allow && allow.split(/\s+/).includes(second ?? "")) return ALLOW;
-  if (ORCA_ASK.has(sub)) return ask(`orca ${sub} ${sub === "serve" ? "opens a server" : "drives the GUI or another account"}`);
-  if (sub === "worktree" && ["rm", "remove", "delete"].includes(second ?? "")) return ask("orca worktree rm removes a worktree");
-  if (ORCA_JUDGE[sub]?.split(/\s+/).includes(second ?? "")) return { ...classify(`orca ${sub} ${second}`), pattern: orcaPattern(sub, second) };
-  return { ...classify(`orca ${sub}${second ? ` ${second}` : ""}`), pattern: orcaPattern(sub, second) };
+  return ALLOW;
 }
 
 // A nested agent started with the guard off, or the guard's own mode variables changed. These
@@ -2987,8 +2967,7 @@ function psCopySources(words: string[]): string[] {
     }
     if (!word.startsWith("-")) positionals.push(word);
   }
-  if (destination !== undefined && positionals.length > 1) positionals.pop();
-  else if (destination === undefined && positionals.length > 1) positionals.pop();
+  if (destination === undefined && positionals.length > 1) positionals.pop();
   const sources = [...paths, ...positionals];
   return sources.filter((s) => s !== destination);
 }
@@ -3130,6 +3109,9 @@ export function powershellVerdict(command: string, _scope?: Scope): Verdict {
     const canonical = PS_ALIASES[word] ?? word;
     if (PS_READERS.has(canonical) || PS_READER_PREFIXES.some((p) => canonical.startsWith(p))) continue;
     if (writesOk && PS_LOCAL_WRITERS.has(canonical)) continue;
+    // Orca CLI calls in PowerShell (including those referencing $env:ORCA_* handles) are always
+    // allowed once destructive PowerShell constructs, redirects and secret env vars have been ruled out.
+    if (orcaProgram(word)) continue;
     // A native program (git, npm, node), not a cmdlet: the shell rules know what these do. Only a
     // plain line, since PowerShell syntax in it would be misread as bash.
     if (_scope && !/^[a-z]+-[a-z]/.test(word)) {

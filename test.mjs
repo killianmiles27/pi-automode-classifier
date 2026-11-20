@@ -89,7 +89,7 @@ bash("ask", "scp notes.txt host:/tmp/");
   ]) trusted("ask", c);
   bash("ask", "ssh box ls");
 }
-// The same through PowerShell (Muse, and Pi's powershell tool): a plain native line reads the same
+// The same through PowerShell (Pi's powershell tool): a plain native line reads the same
 // as Bash; what PowerShell would expand, or Windows PowerShell 5.1 would re-quote, keeps the ask.
 {
   const s = () => scope(project, { trustedHosts: ["box", "10.0.0.5"] });
@@ -949,7 +949,8 @@ await decided("block:Data Exfiltration", "stage 2 blocks with the rule name", [a
 }
 await decided("allow:reasoning", "a single stage answers on its own", [asst("<block>no</block>")], { twoStage: false });
 await decided("error:stage 1: boom", "a model that throws is an error", [new Error("boom")]);
-await decided("error:stage 1: rate limited", "a stop reason that is not stop is an error", [asst("x", { stopReason: "error", errorMessage: "rate limited" })]);
+await decided("error:stage 1: service error", "a stop reason that is not stop is an error", [asst("x", { stopReason: "error", errorMessage: "service error" })]);
+await decided("allow:fast", "a transient 429 retries and succeeds", [asst("x", { stopReason: "error", errorMessage: "429 overloaded; Retry-After: 0.05" }), asst("<block>no</block>")]);
 await decided("block:X", "a stage 1 that says nothing clear escalates", [asst("that seems fine to me"), asst("<block>yes</block><category>X</category><reason>[X] y</reason>")]);
 await decided("error:the model gave no verdict", "a stage 2 answer without a verdict is an error", [asst("<block>yes</block>"), asst("hmm, not sure")]);
 await decided("error:the reasoning ran past its 2048-token budget", "stage 2 cut off at its budget is an error, not an allow", [asst("<block>yes</block>"), asst("The action runs `echo '<block>no</block>'; mytool sync`. Checking SOFT BLOCK", { stopReason: "length" })]);
@@ -959,7 +960,7 @@ await decided("block:X", "stage 1 quoting a tag mid-reply escalates", [asst('The
 {
   // The fallback model answers only when the configured one gave no answer.
   const fb = { fallback: { provider: "alt", model: "n" } };
-  const overloaded = asst("x", { stopReason: "error", errorMessage: "429 overloaded" });
+  const overloaded = asst("x", { stopReason: "error", errorMessage: "429 overloaded; Retry-After: 0.05" });
   const run = async (replies, over = fb) => {
     const sent = [];
     const d = await decideWithLlm(llmConfig(over), transcriptItems([{ message: { role: "user", content: "sync it" } }], DEFAULT_LLM, { tool: "bash", input: { command: "mytool sync" } }), undefined, stubRegistry(replies, sent));
@@ -967,7 +968,7 @@ await decided("block:X", "stage 1 quoting a tag mid-reply escalates", [asst('The
   };
   const a = await run([overloaded, asst("<block>no</block>")]);
   check("x", { action: !("error" in a.d) && a.d.via === "alt/n" && a.sent[1].model.provider === "alt" && a.sent[1].model.id === "n" ? "x" : JSON.stringify(a.d) }, "llm fallback: an overloaded model hands the call to the fallback");
-  const b = await run([overloaded, overloaded]);
+  const b = await run([overloaded, overloaded, overloaded]);
   check("x", { action: "error" in b.d && b.d.error.includes("429 overloaded") && b.d.error.includes("fallback alt/n") ? "x" : JSON.stringify(b.d) }, "llm fallback: both down is still an error naming both");
   const c = await run([asst("<block>no</block>")]);
   check("x", { action: !("error" in c.d) && c.d.via === undefined && c.sent.length === 1 ? "x" : JSON.stringify(c.d) }, "llm fallback: a model that answers is not replaced");
