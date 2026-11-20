@@ -2198,13 +2198,34 @@ function awkVerdict(args: string[], scope: Scope): Verdict {
     program = a;
     break;
   }
-  if (/system\s*\(/.test(program) || /\|\s*"/.test(program)) return outwardClassify("awk that runs commands");
-  for (const m of program.matchAll(/(>>?|\|)\s*([^\s;|})]+)/g)) {
+  // Strip string literals and /regex/ literals before scanning for operators so `||`, `|`, and `>`
+  // inside printed text or regex patterns do not read as pipes or redirects. Keep string literals
+  // for `| "cmd"` and `> "file"` checks by masking only their contents when checking operators.
+  const noStrings = program.replace(/"(?:[^"\\]|\\.)*"/g, '""').replace(/\/(?:[^/\\\n]|\\.)+\//g, "//");
+  if (/\bsystem\s*\(/.test(noStrings) || /(?:^|[^|])\|\s*"/.test(program.replace(/\/(?:[^/\\\n]|\\.)+\//g, "//"))) return outwardClassify("awk that runs commands");
+  // Match `>>`, `>` (not `>=`), or single `|` (not `||`) outside strings and regexes.
+  const scan = program.replace(/\/(?:[^/\\\n]|\\.)+\//g, "//");
+  // Walk outside double-quoted strings so `||` or `>` inside printed text never matches.
+  let inStr = false;
+  let masked = "";
+  for (let i = 0; i < scan.length; i++) {
+    const c = scan[i];
+    if (inStr) {
+      if (c === "\\" && i + 1 < scan.length) { masked += "  "; i++; continue; }
+      if (c === '"') inStr = false;
+      masked += c === '"' ? '"' : " ";
+    } else {
+      if (c === '"') inStr = true;
+      masked += c;
+    }
+  }
+  for (const m of masked.matchAll(/(>>|>(?!=)|(?<!\|)\|(?!\|))\s*([^\s;|})]+)/g)) {
     const op = m[1];
-    const raw = m[2];
+    const start = (m.index ?? 0) + m[0].length - m[2].length;
+    const raw = scan.slice(start, start + m[2].length);
     if (op === "|") return outwardClassify("awk that runs commands");
     if (!raw || raw.startsWith("&") || /^\d+$/.test(raw)) continue;
-    const literal = /^(['"]).*\1$/.test(raw) ? raw.slice(1, -1) : undefined;
+    const literal = /^"((?:[^"\\]|\\.)*)"/.exec(scan.slice(start))?.[1];
     if (literal === undefined) return outwardClassify("awk writes a file whose name is held in a variable");
     const v = writePathVerdict("awk", literal, scope);
     if (v) return v;
@@ -2327,6 +2348,7 @@ function command(cmd: Simple, scope: Scope, depth: number): Verdict {
 
   // Bash's parser cannot determine the semantics of another shell's inline code.
   if (/^(powershell|pwsh)(\.exe)?$/i.test(name)) {
+    if (args.length === 1 && /^(--version|-v|-V|--help|-h|-\?)$/i.test(args[0])) return verdict;
     // -Command carries the text, so the vocabulary can read it; -File and -EncodedCommand hide it.
     const at = args.findIndex((a) => /^-(command|c)$/i.test(a));
     if (at >= 0 && args[at + 1]) return powershellVerdict(args.slice(at + 1).join(" "), scope);
@@ -2699,7 +2721,7 @@ const PS_READERS = new Set([
   "out-string", "out-host", "out-null",
   "write-output", "write-host", "write-verbose", "write-debug", "write-information", "write-warning", "write-error",
   "convertto-json", "convertto-csv", "convertto-xml", "convertto-html", "convertfrom-json", "convertfrom-csv", "convertfrom-stringdata",
-  "foreach", "for", "while", "if", "else", "elseif", "try", "catch", "finally", "switch", "return",
+  "foreach", "for", "while", "if", "else", "elseif", "try", "catch", "finally", "switch", "return", "exit",
   "set-strictmode", "set-location", "set-psdebug",
 ]);
 const PS_READER_PREFIXES = ["get-", "format-"];

@@ -162,6 +162,14 @@ check("rust repo with .cargo/config.toml is not a credential directory", () => {
     fs.rmSync(rustDir, { recursive: true, force: true });
   }
 });
+bash("allow", `awk 'NR>=383 && NR<=397 {printf "%d: %s\\n", NR, $0}' README.md`, "awk >= comparison is not a file redirect");
+bash("allow", `awk 'NR==2{print "if a || b {"; next} 1' README.md`, "awk || inside string is not a command pipe");
+bash("allow", `awk '/foo|bar/,0' README.md`, "awk | inside regex is not a command pipe");
+bash("allow", "pwsh --version", "pwsh --version is allowed");
+check("powershell allows exit", () => {
+  const v = powershellVerdict("git status; exit $LASTEXITCODE", scope());
+  assert.equal(v.action, "allow", JSON.stringify(v));
+});
 
 // ---- B. Verdict classes ----
 
